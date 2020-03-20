@@ -38,6 +38,8 @@ use tari_core::transactions::{
 use tari_service_framework::reply_channel::SenderService;
 use tower::Service;
 
+const LOG_TARGET: &str = "wallet::output_manager_service";
+
 /// API Request enum
 #[derive(Debug)]
 pub enum OutputManagerRequest {
@@ -137,7 +139,10 @@ impl OutputManagerHandle {
 
     pub async fn get_balance(&mut self) -> Result<Balance, OutputManagerError> {
         match self.handle.call(OutputManagerRequest::GetBalance).await?? {
-            OutputManagerResponse::Balance(b) => Ok(b),
+            OutputManagerResponse::Balance(b) => {
+                log::trace!(target: LOG_TARGET, "Balance: {:?}", b);
+                Ok(b)
+            },
             _ => Err(OutputManagerError::UnexpectedApiResponse),
         }
     }
