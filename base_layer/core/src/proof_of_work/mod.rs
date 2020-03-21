@@ -31,6 +31,7 @@ mod proof_of_work;
 pub use blake_pow::test as blake_test;
 
 pub mod lwma_diff;
+pub mod tsa_diff;
 
 pub use blake_pow::{blake_difficulty, blake_difficulty_with_hash};
 pub use diff_adj_manager::{DiffAdjManager, DiffAdjManagerError};

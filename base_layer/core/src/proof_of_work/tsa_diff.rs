@@ -9,101 +9,108 @@
 use crate::proof_of_work::{
     difficulty::{Difficulty, DifficultyAdjustment},
     error::DifficultyAdjustmentError,
+    lwma_diff::LinearWeightedMovingAverage,
 };
 use log::*;
 use std::{cmp, collections::VecDeque};
 use tari_crypto::tari_utilities::epoch_time::EpochTime;
+
 pub const LOG_TARGET: &str = "c::pow::lwma_diff";
 
-pub struct LinearWeightedMovingAverage {
-    pub(in crate::proof_of_work) timestamps: VecDeque<EpochTime>,
-    pub(in crate::proof_of_work) accumulated_difficulties: VecDeque<Difficulty>,
-    pub(in crate::proof_of_work) block_window: usize,
-    pub(in crate::proof_of_work) target_time: u64,
-    pub(in crate::proof_of_work) initial_difficulty: u64,
+pub struct TimeStampAdjustment {
+    lwma_diff: LinearWeightedMovingAverage,
 }
 
-impl LinearWeightedMovingAverage {
-    pub fn new(block_window: usize, target_time: u64, initial_difficulty: u64) -> LinearWeightedMovingAverage {
-        LinearWeightedMovingAverage {
+impl TimeStampAdjustment {
+    pub fn new(block_window: usize, target_time: u64, initial_difficulty: u64) -> TimeStampAdjustment {
+        let lwma_diff = LinearWeightedMovingAverage {
             timestamps: VecDeque::with_capacity(block_window + 1),
             accumulated_difficulties: VecDeque::with_capacity(block_window + 1),
             block_window,
             target_time,
             initial_difficulty,
-        }
+        };
+        TimeStampAdjustment { lwma_diff }
     }
 
     fn calculate(&self) -> Difficulty {
-        let timestamps = &self.timestamps;
-        if timestamps.len() <= 1 {
+        let timestamps = &self.lwma_diff.timestamps;
+        if timestamps.len() <= 2 {
             // return INITIAL_DIFFICULTY;
-            return self.initial_difficulty.into();
+            return self.lwma_diff.initial_difficulty.into();
         }
 
-        // Use the array length rather than block_window to include early cases where the no. of pts < block_window
-        let n = (timestamps.len() - 1) as u64;
+        let mut lwma_diff = self.lwma_diff.get_difficulty().as_u64() as f64;
 
-        let mut weighted_times: u64 = 0;
+        // R is the "softness" of the per-block TSA adjustment to the DA. R<6 is aggressive.
+        let R = 2;
+        // "m" is a factor to help get e^x from integer math. 1E5 was not as precise
+        let m = 1E6;
+        let mut exm = m as f64; // This will become m*e^x. Initial value is m*e^(mod(<1)) = m.
 
-        let difficulty: u64 = self.accumulated_difficulties[n as usize]
-            .checked_sub(self.accumulated_difficulties[0])
-            .expect("Accumulated difficulties cannot decrease in proof of work")
-            .as_u64();
-        let ave_difficulty = difficulty as f64 / n as f64;
-
-        let mut previous_timestamp = timestamps[0];
-        let mut this_timestamp;
-        // Loop through N most recent blocks.
-        for i in 1..(n + 1) as usize {
-            // 6*T limit prevents large drops in diff from long solve times which would cause oscillations.
-            // We cannot have if solve_time < 1 then solve_time = 1, this will greatly increase the next timestamp
-            // difficulty which will lower the difficulty
-            if timestamps[i] > previous_timestamp {
-                this_timestamp = timestamps[i];
-            } else {
-                this_timestamp = previous_timestamp.increase(1);
-            }
-            let solve_time = cmp::min((this_timestamp - previous_timestamp).as_u64(), 6 * self.target_time);
-            previous_timestamp = this_timestamp;
-
-            // Give linearly higher weight to more recent solve times.
-            // Note: This will not overflow for practical values of block_window and solve time.
-            weighted_times += solve_time * i as u64;
-        }
-        // k is the sum of weights (1+2+..+n) * target_time
-        let k = n * (n + 1) * self.target_time / 2;
-        let target = ave_difficulty * k as f64 / weighted_times as f64;
-        trace!(
-            target: LOG_TARGET,
-            "DiffCalc; t={}; bw={}; n={}; ts[0]={}; ts[n]={}; weighted_ts={}; k={}; diff[0]={}; diff[n]={}; \
-             ave_difficulty={}; target={}",
-            self.target_time,
-            self.block_window,
-            n,
-            timestamps[0],
-            timestamps[n as usize],
-            weighted_times,
-            k,
-            self.accumulated_difficulties[0],
-            self.accumulated_difficulties[n as usize],
-            ave_difficulty,
-            target
+        let n = timestamps.len() as u64 - 1;
+        let prev_timestamp = timestamps[n as usize - 1];
+        let this_timestamp = if timestamps[n as usize] > prev_timestamp {
+            timestamps[n as usize]
+        } else {
+            prev_timestamp.increase(1)
+        };
+        let mut solve_time = cmp::min(
+            (this_timestamp - prev_timestamp).as_u64(),
+            6 * self.lwma_diff.target_time,
         );
-        if target > std::u64::MAX as f64 {
-            error!(
-                target: LOG_TARGET,
-                "Difficulty has overflowed, current is: {:?}", target
-            );
-            panic!("Difficulty target has overflowed");
+
+        // #########  Begin Unwanted Modification to TSA logic
+        //----------Xbuffer------------------------------
+        let mut asc = (timestamps[n as usize] - timestamps[0]).as_u64(); // accumulated solve time
+        if (asc / n + 1 <= self.lwma_diff.target_time / R) {
+            asc = (asc / (n + 1) / self.lwma_diff.target_time) * asc;
+        };
+        solve_time = (solve_time * ((asc / (n + 1) * 1000) / self.lwma_diff.target_time)) / 1000;
+        if (solve_time < 0) {
+            solve_time = 0;
         }
-        let target = target.ceil() as u64; // difficulty difference of 1 should not matter much, but difficulty should never be below 1, ceil(0.9) = 1
-        debug!(target: LOG_TARGET, "New target difficulty: {}", target);
+        if ((prev_timestamp - timestamps[n as usize - 1]) <= (self.lwma_diff.target_time / R).into() &&
+            solve_time < (self.lwma_diff.target_time - (self.lwma_diff.target_time / 5)))
+        {
+            lwma_diff = lwma_diff * (1.0 / 5.0);
+        } else if (solve_time <= self.lwma_diff.target_time / 5) {
+            lwma_diff = lwma_diff * (1.0 / 5.0);
+        }
+        // ########### Begin Actual TSA   ##########
+        else {
+            // It would be good to turn the for statement into a look-up table;
+            let mut i = 1;
+            while (i <= solve_time / self.lwma_diff.target_time / R) {
+                exm = (exm * (2.71828 * m)) / m;
+                i += 1;
+            }
+            let f = (solve_time % (self.lwma_diff.target_time * R)) as f64;
+            exm = (exm *
+                (m + (f *
+                    (m + (f *
+                        (m + (f * (m + (f * m) / (4 * self.lwma_diff.target_time * R) as f64)) /
+                            (3 * self.lwma_diff.target_time * R) as f64)) /
+                        (2 * self.lwma_diff.target_time * R) as f64)) /
+                    (self.lwma_diff.target_time * R) as f64)) /
+                m;
+            // 1000 below is to prevent overflow on testnet
+            lwma_diff = (lwma_diff *
+                ((1000.0 *
+                    (m * self.lwma_diff.target_time as f64 +
+                        (solve_time - self.lwma_diff.target_time) as f64 * exm)) /
+                    (m * solve_time as f64))) /
+                1000.0;
+        }
+        // if (lwma_diff > powLimit) {
+        //     lwma_diff = powLimit;
+        // }
+        let target = lwma_diff.ceil() as u64;
         target.into()
     }
 }
 
-impl DifficultyAdjustment for LinearWeightedMovingAverage {
+impl DifficultyAdjustment for TimeStampAdjustment {
     fn add(
         &mut self,
         timestamp: EpochTime,
@@ -116,21 +123,7 @@ impl DifficultyAdjustment for LinearWeightedMovingAverage {
             timestamp,
             accumulated_difficulty
         );
-        match self.accumulated_difficulties.back() {
-            None => {},
-            Some(v) => {
-                if accumulated_difficulty <= *v {
-                    return Err(DifficultyAdjustmentError::DecreasingAccumulatedDifficulty);
-                }
-            },
-        };
-        self.timestamps.push_back(timestamp);
-        self.accumulated_difficulties.push_back(accumulated_difficulty);
-        while self.timestamps.len() > self.block_window + 1 {
-            self.timestamps.pop_front();
-            self.accumulated_difficulties.pop_front();
-        }
-        Ok(())
+        self.lwma_diff.add(timestamp, accumulated_difficulty)
     }
 
     fn get_difficulty(&self) -> Difficulty {
@@ -143,22 +136,22 @@ mod test {
     use super::*;
 
     #[test]
-    fn lwma_zero_len() {
-        let dif = LinearWeightedMovingAverage::new(90, 120, 1);
+    fn tsa_zero_len() {
+        let dif = TimeStampAdjustment::new(90, 120, 1);
         assert_eq!(dif.get_difficulty(), Difficulty::min());
     }
 
     #[test]
-    fn lwma_add_non_increasing_diff() {
-        let mut dif = LinearWeightedMovingAverage::new(90, 120, 1);
+    fn tsa_add_non_increasing_diff() {
+        let mut dif = TimeStampAdjustment::new(90, 120, 1);
         assert!(dif.add(100.into(), 100.into()).is_ok());
         assert!(dif.add(100.into(), 100.into()).is_err());
         assert!(dif.add(100.into(), 50.into()).is_err());
     }
 
     #[test]
-    fn lwma_negative_solve_times() {
-        let mut dif = LinearWeightedMovingAverage::new(90, 120, 1);
+    fn tsa_negative_solve_times() {
+        let mut dif = TimeStampAdjustment::new(90, 120, 1);
         let mut timestamp = 60.into();
         let mut cum_diff = Difficulty::from(100);
         let _ = dif.add(timestamp, cum_diff);
@@ -185,7 +178,7 @@ mod test {
     }
 
     #[test]
-    fn lwma_limit_difficulty_change() {
+    fn tsa_limit_difficulty_change() {
         let mut dif = LinearWeightedMovingAverage::new(5, 60, 1);
         let _ = dif.add(60.into(), 100.into());
         let _ = dif.add(10_000_000.into(), 200.into());
@@ -201,7 +194,7 @@ mod test {
     // Diff:     100, 100, 100, 100, 100, 105, 128, 123, 116,  94,  39,  46,  55,  75, 148
     // Acum dif: 100, 200, 300, 400, 500, 605, 733, 856, 972,1066,1105,1151,1206,1281,1429
     // Target:     1, 100, 100, 100, 100, 107, 136, 130, 120,  94,  36,  39,  47,  67, 175
-    fn lwma_calculate() {
+    fn tsa_calculate() {
         let mut dif = LinearWeightedMovingAverage::new(5, 60, 1);
         let _ = dif.add(60.into(), 100.into());
         assert_eq!(dif.get_difficulty(), 1.into());
