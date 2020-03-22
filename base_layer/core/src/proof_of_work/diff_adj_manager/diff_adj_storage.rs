@@ -27,7 +27,7 @@ use crate::{
     proof_of_work::{
         diff_adj_manager::error::DiffAdjManagerError,
         difficulty::DifficultyAdjustment,
-        lwma_diff::LinearWeightedMovingAverage,
+        tsa_diff::TimeStampAdjustment,
         Difficulty,
         PowAlgorithm,
         ProofOfWork,
@@ -53,8 +53,8 @@ enum UpdateState {
 /// DiffAdjManager makes use of DiffAdjStorage to provide thread save access to its LinearWeightedMovingAverages for
 /// each PoW algorithm.
 pub struct DiffAdjStorage {
-    monero_lwma: LinearWeightedMovingAverage,
-    blake_lwma: LinearWeightedMovingAverage,
+    monero_lwma: TimeStampAdjustment,
+    blake_lwma: TimeStampAdjustment,
     sync_data: Option<(u64, BlockHash)>,
     timestamps: VecDeque<EpochTime>,
     difficulty_block_window: u64,
@@ -67,12 +67,12 @@ impl DiffAdjStorage {
     /// Constructs a new DiffAdjStorage with access to the blockchain db.
     pub fn new(consensus_constants: &ConsensusConstants) -> Self {
         Self {
-            monero_lwma: LinearWeightedMovingAverage::new(
+            monero_lwma: TimeStampAdjustment::new(
                 consensus_constants.get_difficulty_block_window() as usize,
                 consensus_constants.get_diff_target_block_interval(),
                 consensus_constants.min_pow_difficulty(),
             ),
-            blake_lwma: LinearWeightedMovingAverage::new(
+            blake_lwma: TimeStampAdjustment::new(
                 consensus_constants.get_difficulty_block_window() as usize,
                 consensus_constants.get_diff_target_block_interval(),
                 consensus_constants.min_pow_difficulty(),
@@ -282,12 +282,12 @@ impl DiffAdjStorage {
 
     // Resets the DiffAdjStorage.
     fn reset(&mut self) {
-        self.monero_lwma = LinearWeightedMovingAverage::new(
+        self.monero_lwma = TimeStampAdjustment::new(
             self.difficulty_block_window as usize,
             self.diff_target_block_interval,
             self.min_pow_difficulty,
         );
-        self.blake_lwma = LinearWeightedMovingAverage::new(
+        self.blake_lwma = TimeStampAdjustment::new(
             self.difficulty_block_window as usize,
             self.diff_target_block_interval,
             self.min_pow_difficulty,
@@ -296,7 +296,7 @@ impl DiffAdjStorage {
         self.timestamps = VecDeque::new();
     }
 
-    // Adds the new PoW sample to the specific LinearWeightedMovingAverage specified by the PoW algorithm.
+    // Adds the new PoW sample to the specific TimeStampAdjustment specified by the PoW algorithm.
     fn add(&mut self, timestamp: EpochTime, pow: ProofOfWork) -> Result<(), DiffAdjManagerError> {
         match pow.pow_algo {
             PowAlgorithm::Monero => self.monero_lwma.add(timestamp, pow.accumulated_monero_difficulty)?,

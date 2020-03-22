@@ -29,13 +29,7 @@ use tari_core::{
     chain_storage::{BlockchainDatabase, MemoryDatabase},
     consensus::{ConsensusConstants, ConsensusManagerBuilder, Network},
     helpers::create_mem_db,
-    proof_of_work::{
-        lwma_diff::LinearWeightedMovingAverage,
-        DiffAdjManager,
-        Difficulty,
-        DifficultyAdjustment,
-        PowAlgorithm,
-    },
+    proof_of_work::{tsa_diff::TimeStampAdjustment, DiffAdjManager, Difficulty, DifficultyAdjustment, PowAlgorithm},
     transactions::types::HashDigest,
 };
 use tari_crypto::tari_utilities::epoch_time::EpochTime;
@@ -79,7 +73,7 @@ fn calculate_accumulated_difficulty(
     consensus_constants: &ConsensusConstants,
 ) -> Difficulty
 {
-    let mut lwma = LinearWeightedMovingAverage::new(
+    let mut lwma = TimeStampAdjustment::new(
         consensus_constants.get_difficulty_block_window() as usize,
         consensus_constants.get_diff_target_block_interval(),
         consensus_constants.min_pow_difficulty(),

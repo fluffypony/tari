@@ -35,12 +35,13 @@ impl TimeStampAdjustment {
 
     fn calculate(&self) -> Difficulty {
         let timestamps = &self.lwma_diff.timestamps;
-        if timestamps.len() <= 2 {
+        if timestamps.len() <= 20 {
             // return INITIAL_DIFFICULTY;
             return self.lwma_diff.initial_difficulty.into();
         }
 
-        let mut lwma_diff = self.lwma_diff.get_difficulty().as_u64() as f64;
+        let (lwma_diff, t, k) = self.lwma_diff.calculate_with_tk();
+        let mut lwma_diff = lwma_diff.as_u64() as f64;
 
         // R is the "softness" of the per-block TSA adjustment to the DA. R<6 is aggressive.
         let R = 2;
@@ -49,63 +50,92 @@ impl TimeStampAdjustment {
         let mut exm = m as f64; // This will become m*e^x. Initial value is m*e^(mod(<1)) = m.
 
         let n = timestamps.len() as u64 - 1;
-        let prev_timestamp = timestamps[n as usize - 1];
-        let this_timestamp = if timestamps[n as usize] > prev_timestamp {
-            timestamps[n as usize]
-        } else {
-            prev_timestamp.increase(1)
-        };
+        let prev_timestamp = timestamps[n as usize];
+        let this_timestamp = EpochTime::now();
+
+        debug!("new tsa_diff requested  prev timestamp {}", prev_timestamp);
+        debug!("new tsa_diff requested  this_timestamp {}", this_timestamp);
+
         let mut solve_time = cmp::min(
             (this_timestamp - prev_timestamp).as_u64(),
             6 * self.lwma_diff.target_time,
-        );
+        ) as f64;
 
         // #########  Begin Unwanted Modification to TSA logic
         //----------Xbuffer------------------------------
-        let mut asc = (timestamps[n as usize] - timestamps[0]).as_u64(); // accumulated solve time
-        if (asc / n + 1 <= self.lwma_diff.target_time / R) {
-            asc = (asc / (n + 1) / self.lwma_diff.target_time) * asc;
-        };
-        solve_time = (solve_time * ((asc / (n + 1) * 1000) / self.lwma_diff.target_time)) / 1000;
-        if (solve_time < 0) {
-            solve_time = 0;
+        // let mut asc = timestamps[n as usize].as_u64() as f64 - timestamps[0].as_u64() as f64; // accumulated solve
+        // time if (asc / (n + 1) as f64 <= self.lwma_diff.target_time as f64 / R as f64) {
+        //     asc = (asc / (n + 1) as f64 / self.lwma_diff.target_time as f64) * asc;
+        // };
+        // solve_time =
+        //     (solve_time * ((asc as f64 / (n + 1) as f64 * 1000.0) / self.lwma_diff.target_time as f64)) / 1000.0;
+        // if (solve_time < 0.0) {
+        //     solve_time = 0.0;
+        // }
+        // dbg!(&prev_timestamp);
+        // dbg!(&timestamps[n as usize - 1]);
+        // let timestamp_diff = if timestamps[n as usize - 1] > prev_timestamp {
+        //     1.into()
+        // } else {
+        //     prev_timestamp - timestamps[n as usize - 1]
+        // };
+        // if ((timestamp_diff) <= (self.lwma_diff.target_time / R).into() &&
+        //     solve_time < (self.lwma_diff.target_time as f64 - (self.lwma_diff.target_time as f64 / 5.0)))
+        // {
+        //     lwma_diff = lwma_diff * (1.0 / 5.0);
+        // } else if (solve_time <= self.lwma_diff.target_time as f64 / 5.0) {
+        //     lwma_diff = lwma_diff * (1.0 / 5.0);
+        // }
+        // // ########### Begin Actual TSA   ##########
+        // else {
+        // It would be good to turn the for statement into a look-up table;
+        let mut i = 1.0;
+        while (i <= solve_time / (self.lwma_diff.target_time as f64 * R as f64)) {
+            exm = (exm * (2.71828 * m)) / m;
+            i += 1.0;
         }
-        if ((prev_timestamp - timestamps[n as usize - 1]) <= (self.lwma_diff.target_time / R).into() &&
-            solve_time < (self.lwma_diff.target_time - (self.lwma_diff.target_time / 5)))
-        {
-            lwma_diff = lwma_diff * (1.0 / 5.0);
-        } else if (solve_time <= self.lwma_diff.target_time / 5) {
-            lwma_diff = lwma_diff * (1.0 / 5.0);
-        }
-        // ########### Begin Actual TSA   ##########
-        else {
-            // It would be good to turn the for statement into a look-up table;
-            let mut i = 1;
-            while (i <= solve_time / self.lwma_diff.target_time / R) {
-                exm = (exm * (2.71828 * m)) / m;
-                i += 1;
-            }
-            let f = (solve_time % (self.lwma_diff.target_time * R)) as f64;
-            exm = (exm *
+        let f = (solve_time % (self.lwma_diff.target_time as f64 * R as f64)) as f64;
+        exm = (exm *
+            (m + (f *
                 (m + (f *
-                    (m + (f *
-                        (m + (f * (m + (f * m) / (4 * self.lwma_diff.target_time * R) as f64)) /
-                            (3 * self.lwma_diff.target_time * R) as f64)) /
-                        (2 * self.lwma_diff.target_time * R) as f64)) /
-                    (self.lwma_diff.target_time * R) as f64)) /
-                m;
-            // 1000 below is to prevent overflow on testnet
-            lwma_diff = (lwma_diff *
-                ((1000.0 *
-                    (m * self.lwma_diff.target_time as f64 +
-                        (solve_time - self.lwma_diff.target_time) as f64 * exm)) /
-                    (m * solve_time as f64))) /
-                1000.0;
-        }
+                    (m + (f * (m + (f * m) / (4 * self.lwma_diff.target_time * R) as f64)) /
+                        (3 * self.lwma_diff.target_time * R) as f64)) /
+                    (2 * self.lwma_diff.target_time * R) as f64)) /
+                (self.lwma_diff.target_time * R) as f64)) /
+            m;
+        // 1000 below is to prevent overflow on testnet
+        // lwma_diff = (lwma_diff *
+        //     ((1000.0 *
+        //         (m * self.lwma_diff.target_time as f64 +
+        //             (solve_time - self.lwma_diff.target_time as f64) as f64 * exm)) /
+        //         (m * solve_time as f64))) /
+        //     1000.0;
+        // }
         // if (lwma_diff > powLimit) {
         //     lwma_diff = powLimit;
         // }
+        lwma_diff = (lwma_diff *
+            ((1000.0 *
+                (m * self.lwma_diff.target_time as f64 + (solve_time - self.lwma_diff.target_time as f64) / exm)) /
+                (m * solve_time))) /
+            1000.0;
+
+        // dbg!(m * self.lwma_diff.target_time as f64);
+        // dbg!(exm);
+        // dbg!(lwma_diff);
+        // dbg!(solve_time - self.lwma_diff.target_time as f64);
+        // dbg!(m * solve_time);
+        // dbg!(m * self.lwma_diff.target_time as f64 + (solve_time - self.lwma_diff.target_time as f64) * exm);
+
+        // lwma_diff = lwma_diff * (m * solve_time) /
+        //     (m * self.lwma_diff.target_time as f64 + (solve_time - self.lwma_diff.target_time as f64) * exm);
+
+        // Next line is by kalkan of Xchange to fix low-solvetime problem. May cause overflow on testnet
+        // A better pre-TSA algo than LWMA above will prevent the need for this.
+        // lwma_diff = (lwma_diff * self.lwma_diff.target_time as f64 * k as f64) / t as f64;
+
         let target = lwma_diff.ceil() as u64;
+        debug!("new tsa_diff requested {}", target);
         target.into()
     }
 }
@@ -173,10 +203,48 @@ mod test {
             let _ = dif.add(timestamp, cum_diff);
             let diff_after = dif.get_difficulty();
             // Algo should handle this as 1sec solve time thus increase the difficulty constantly
-            assert!(diff_after > diff_before);
+            dbg!(&diff_after);
+            assert!(diff_after >= diff_before);
         }
     }
 
+    #[test]
+    fn tsa_test_change() {
+        let mut dif = TimeStampAdjustment::new(90, 120, 1);
+        let mut timestamp = 60.into();
+        let mut cum_diff = Difficulty::from(100);
+        let _ = dif.add(timestamp, cum_diff);
+        timestamp = timestamp.increase(60);
+        cum_diff += Difficulty::from(100);
+        let _ = dif.add(timestamp, cum_diff);
+        // Lets create a history and populate the vecs
+        for _i in 0..150 {
+            cum_diff += Difficulty::from(100);
+            timestamp = timestamp.increase(120);
+            let _ = dif.add(timestamp, cum_diff);
+        }
+
+        // lets add shorter ones
+        for _i in 0..150 {
+            cum_diff += Difficulty::from(100);
+            timestamp = timestamp.increase(110);
+            let diff_before = dif.get_difficulty();
+            let _ = dif.add(timestamp, cum_diff);
+            let diff_after = dif.get_difficulty();
+            assert!(diff_after >= diff_before);
+        }
+
+        // lets add longer ones
+        for _i in 0..150 {
+            cum_diff += Difficulty::from(100);
+            timestamp = timestamp.increase(130);
+            let diff_before = dif.get_difficulty();
+            let _ = dif.add(timestamp, cum_diff);
+            let diff_after = dif.get_difficulty();
+            assert!(diff_after <= diff_before);
+        }
+    }
+    #[ignore]
     #[test]
     fn tsa_limit_difficulty_change() {
         let mut dif = LinearWeightedMovingAverage::new(5, 60, 1);
@@ -187,6 +255,7 @@ mod test {
         assert_eq!(dif.get_difficulty(), 10.into());
     }
 
+    #[ignore]
     #[test]
     // Data for 5-period moving average
     // Timestamp: 60, 120, 180, 240, 300, 350, 380, 445, 515, 615, 975, 976, 977, 978, 979

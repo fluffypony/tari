@@ -35,6 +35,7 @@ use crate::{
         types::{CryptoFactories, PrivateKey},
     },
 };
+use async_std::task as async_task;
 use core::sync::atomic::AtomicBool;
 use futures::{
     channel::{
@@ -53,9 +54,7 @@ use std::{
 };
 use tari_broadcast_channel::Subscriber;
 use tari_crypto::keys::SecretKey;
-use tokio::task::spawn_blocking;
-
-use tokio::task;
+use tokio::{task, task::spawn_blocking};
 
 pub const LOG_TARGET: &str = "c::m::miner";
 
@@ -135,15 +134,19 @@ impl Miner {
         let mut block = self.get_block(block_template).await?;
         debug!(target: LOG_TARGET, "Miner got new block to mine.");
         let difficulty = self.get_req_difficulty().await?;
+        trace!("New target diff : {}", difficulty);
         let (tx, mut rx): (Sender<Option<BlockHeader>>, Receiver<Option<BlockHeader>>) = mpsc::channel(self.threads);
         for _ in 0..self.threads {
             let stop_mining_flag = self.stop_mining_flag.clone();
             let header = block.header.clone();
             let mut tx_channel = tx.clone();
+            let diff_tx = self.node_interface.clone();
             trace!("spawning mining thread");
             spawn_blocking(move || {
-                let result = CpuBlakePow::mine(difficulty, header, stop_mining_flag);
+                let result = async_task::block_on(CpuBlakePow::mine(header, stop_mining_flag, diff_tx));
                 // send back what the miner found, None will be sent if the miner did not find a nonce
+
+                trace!("closing mining thread");
                 tx_channel.try_send(result);
             });
         }

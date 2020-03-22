@@ -142,7 +142,7 @@ impl ConsensusConstants {
             emission_initial: 5_538_846_115 * uT,
             emission_decay: 0.999_999_560_409_038_5,
             emission_tail: 1 * T,
-            min_pow_difficulty: 3_000_000,
+            min_pow_difficulty: 100_000,
         }
     }
 

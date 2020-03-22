@@ -21,8 +21,10 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use crate::{
+    base_node::comms_interface::LocalNodeCommsInterface,
     blocks::BlockHeader,
-    proof_of_work::{Difficulty, ProofOfWork},
+    mining::error::MinerError,
+    proof_of_work::{Difficulty, PowAlgorithm, ProofOfWork},
 };
 use log::*;
 use rand::{rngs::OsRng, RngCore};
@@ -35,6 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tari_crypto::tari_utilities::epoch_time::EpochTime;
+
 pub const LOG_TARGET: &str = "c::m::blake_miner";
 
 /// A simple Blake2b-based proof of work. This is currently intended to be used for testing and perhaps Testnet until
@@ -48,21 +51,41 @@ pub struct CpuBlakePow;
 impl CpuBlakePow {
     /// A simple miner. It starts with a random nonce and iterates until it finds a header hash that meets the desired
     /// target
-    pub fn mine(
-        target_difficulty: Difficulty,
+    pub async fn mine(
         mut header: BlockHeader,
         stop_flag: Arc<AtomicBool>,
+        mut node_interface: LocalNodeCommsInterface,
     ) -> Option<BlockHeader>
     {
         let mut start = Instant::now();
+        let mut time_updater = Instant::now();
         let mut nonce: u64 = OsRng.next_u64();
         let start_nonce = nonce;
         let mut last_measured_nonce = nonce;
         // We're mining over here!
         let mut difficulty = ProofOfWork::achieved_difficulty(&header);
         info!(target: LOG_TARGET, "Mining started.");
+        let mut target_difficulty = CpuBlakePow::get_req_difficulty(&mut node_interface)
+            .await
+            .unwrap_or(0.into());
+        if target_difficulty == 0.into() {
+            info!(target: LOG_TARGET, "Mining stopped via problem with diff");
+            return None;
+        };
+        header.timestamp = EpochTime::now();
         debug!(target: LOG_TARGET, "Mining for difficulty: {:?}", target_difficulty);
         while difficulty < target_difficulty {
+            if time_updater.elapsed() >= Duration::from_secs(10) {
+                target_difficulty = CpuBlakePow::get_req_difficulty(&mut node_interface)
+                    .await
+                    .unwrap_or(0.into());
+                header.timestamp = EpochTime::now();
+                time_updater = Instant::now();
+            };
+            if target_difficulty == 0.into() {
+                info!(target: LOG_TARGET, "Mining stopped via problem with diff");
+                return None;
+            };
             if start.elapsed() >= Duration::from_secs(60) {
                 // nonce might have wrapped around
                 let hashes = if nonce >= last_measured_nonce {
@@ -72,6 +95,7 @@ impl CpuBlakePow {
                 };
                 let hash_rate = hashes as f64 / start.elapsed().as_micros() as f64;
                 info!(target: LOG_TARGET, "Mining hash rate per thread: {:.6} MH/s", hash_rate);
+                debug!(target: LOG_TARGET, "Mining for difficulty: {:?}", target_difficulty);
                 last_measured_nonce = nonce;
                 start = Instant::now();
             }
@@ -84,9 +108,6 @@ impl CpuBlakePow {
             } else {
                 nonce += 1;
             }
-            if nonce == start_nonce {
-                header.timestamp = EpochTime::now();
-            }
             header.nonce = nonce;
             difficulty = ProofOfWork::achieved_difficulty(&header);
         }
@@ -94,5 +115,22 @@ impl CpuBlakePow {
         debug!(target: LOG_TARGET, "Miner found nonce: {}", nonce);
         trace!(target: LOG_TARGET, "Mined achieved difficulty: {}", difficulty);
         Some(header)
+    }
+
+    pub async fn get_req_difficulty(node_interface: &mut LocalNodeCommsInterface) -> Result<Difficulty, MinerError> {
+        trace!(target: LOG_TARGET, "Requesting target difficulty from node");
+        let result = node_interface
+            .get_target_difficulty(PowAlgorithm::Blake)
+            .await
+            .or_else(|e| {
+                error!(
+                    target: LOG_TARGET,
+                    "Could not get the required difficulty from the base node. {:?}.", e
+                );
+
+                Err(e)
+            })
+            .map_err(|e| MinerError::CommunicationError(e.to_string()))?;
+        Ok(result)
     }
 }
