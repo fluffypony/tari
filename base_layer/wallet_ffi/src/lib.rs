@@ -2246,7 +2246,7 @@ pub unsafe extern "C" fn wallet_create(
 
             let lconfig = Config::builder()
                 .appender(Appender::builder().build("logfile", Box::new(logfile)))
-                .build(Root::builder().appender("logfile").build(LevelFilter::Debug))
+                .build(Root::builder().appender("logfile").build(LevelFilter::Trace))
                 .unwrap();
 
             log4rs::init_config(lconfig).expect("Should be able to start logging");

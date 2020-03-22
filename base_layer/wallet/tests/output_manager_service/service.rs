@@ -628,6 +628,7 @@ fn test_confirming_received_output_sqlite_db() {
 
 #[test]
 fn test_startup_utxo_scan() {
+    let _ = env_logger::try_init();
     let factories = CryptoFactories::default();
 
     let mut runtime = Runtime::new().unwrap();

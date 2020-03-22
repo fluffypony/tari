@@ -298,13 +298,21 @@ where
 
         trace!(target: LOG_TARGET, "Handling a Base Node Response");
 
+        trace!(
+            target: LOG_TARGET,
+            "Queried Hashes to be considered for Invalidation: {:?}",
+            queried_hashes
+        );
+
         // Construct a HashMap of all the unspent outputs
         let unspent_outputs: Vec<UnblindedOutput> = self.db.get_unspent_outputs().await?;
 
         let mut output_hashes = HashMap::new();
         for uo in unspent_outputs.iter() {
             let hash = uo.as_transaction_output(&self.factories)?.hash();
+            trace!(target: LOG_TARGET, "Stored Hash: {:?}", hash);
             if queried_hashes.iter().find(|h| &&hash == h).is_some() {
+                trace!(target: LOG_TARGET, "Hash included for invalidation");
                 output_hashes.insert(hash.clone(), uo.clone());
             }
         }
@@ -316,6 +324,7 @@ where
                 .hash();
 
             let _ = output_hashes.remove(&response_hash);
+            trace!(target: LOG_TARGET, "Removing {:?}", response_hash);
         }
 
         // If there are any remaining Unspent Outputs we will move them to the invalid collection
@@ -323,6 +332,11 @@ where
             debug!(
                 target: LOG_TARGET,
                 "Output with value {} not returned from Base Node query and is thus being invalidated", v.value
+            );
+            trace!(
+                target: LOG_TARGET,
+                "Hash of removed: {:?}",
+                v.as_transaction_output(&self.factories)?.hash()
             );
             self.db.invalidate_output(v).await?;
         }
@@ -397,6 +411,7 @@ where
                     .await?;
                 // TODO Remove this once this bug is fixed
                 trace!(target: LOG_TARGET, "Query sent to Base Node");
+                trace!(target: LOG_TARGET, "Hashes in query: {:?}", output_hashes);
                 self.pending_utxo_query_keys.insert(request_key, output_hashes);
                 let state_timeout = StateDelay::new(self.config.base_node_query_timeout, request_key);
                 utxo_query_timeout_futures.push(state_timeout.delay().boxed());
