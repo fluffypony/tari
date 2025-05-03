@@ -36,6 +36,7 @@ use crate::{
         ConnectivityRequest,
         ConnectivityRequester,
         ConnectivityStatus,
+        ConnectionPoolDiagnostics,
     },
     peer_manager::NodeId,
 };
@@ -301,7 +302,25 @@ impl ConnectivityManagerMock {
             GetAllowList(reply) => {
                 let _result = reply.send(vec![]);
             },
-            GetMinimizeConnectionsThreshold(_) => unimplemented!(),
+            GetConnectionPoolDiagnostics(reply) => {
+                // Create a dummy diagnostics object for testing
+                let diagnostics = ConnectionPoolDiagnostics {
+                    total_connections: 0,
+                    connected_nodes: 0,
+                    connected_clients: 0,
+                    failed_connections: 0,
+                    disconnected_connections: 0,
+                    minimize_connections_enabled: false,
+                    minimize_connections_threshold: None,
+                    connection_reaping_enabled: false,
+                    reaper_min_connection_threshold: 0,
+                    long_lived_connections: 0,
+                    daily_rotation_connections: 0,
+                    frequent_rotation_connections: 0,
+                    allow_list_size: 0,
+                };
+                let _result = reply.send(diagnostics);
+            },            GetMinimizeConnectionsThreshold(_) => unimplemented!(),
         }
     }
 }

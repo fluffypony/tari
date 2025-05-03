@@ -106,6 +106,23 @@ impl CommandContext {
             }
         });
         status_line.add_field("Connections", format!("{}|{}", num_nodes, num_clients));
+        
+        // Add connection diagnostics
+        let mut connectivity = self.comms.connectivity();
+        if let Ok(diag) = connectivity.get_connection_pool_diagnostics().await {
+            // Add a new field with connection diagnostics
+            status_line.add_field(
+                "Conn Diag", 
+                format!(
+                    "Total: {}, Min: {}, Limits: {}|{}|{}", 
+                    diag.total_connections,
+                    diag.minimize_connections_enabled,
+                    diag.long_lived_connections,
+                    diag.daily_rotation_connections,
+                    diag.frequent_rotation_connections
+                )
+            );
+        }        
         let banned_peers = self.fetch_banned_peers().await?;
         status_line.add_field("Banned", banned_peers.len());
 

@@ -39,7 +39,7 @@ pub use error::ConnectivityError;
 
 mod manager;
 pub(crate) use manager::ConnectivityManager;
-pub use manager::ConnectivityStatus;
+pub use manager::{ConnectivityStatus, ConnectionPoolDiagnostics};
 
 #[cfg(feature = "metrics")]
 mod metrics;

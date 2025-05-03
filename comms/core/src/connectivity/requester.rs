@@ -35,7 +35,7 @@ use tokio::{
 use super::{
     connection_pool::PeerConnectionState,
     error::ConnectivityError,
-    manager::ConnectivityStatus,
+    manager::{ConnectivityStatus, ConnectionPoolDiagnostics},
     ConnectivitySelection,
 };
 use crate::{
@@ -107,8 +107,8 @@ pub enum ConnectivityRequest {
     GetSeeds(oneshot::Sender<Vec<Peer>>),
     GetPeerStats(NodeId, oneshot::Sender<Option<Peer>>),
     GetNodeIdentity(oneshot::Sender<NodeIdentity>),
+    GetConnectionPoolDiagnostics(oneshot::Sender<ConnectionPoolDiagnostics>),
 }
-
 /// Handle to make requests and read events from the ConnectivityManager actor.
 #[derive(Debug, Clone)]
 pub struct ConnectivityRequester {
@@ -312,6 +312,16 @@ impl ConnectivityRequester {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(ConnectivityRequest::GetNodeIdentity(reply_tx))
+            .await
+            .map_err(|_| ConnectivityError::ActorDisconnected)?;
+        reply_rx.await.map_err(|_| ConnectivityError::ActorResponseCancelled)
+    }
+
+    /// Get diagnostics information about the connection pool.
+    pub async fn get_connection_pool_diagnostics(&mut self) -> Result<ConnectionPoolDiagnostics, ConnectivityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(ConnectivityRequest::GetConnectionPoolDiagnostics(reply_tx))
             .await
             .map_err(|_| ConnectivityError::ActorDisconnected)?;
         reply_rx.await.map_err(|_| ConnectivityError::ActorResponseCancelled)
