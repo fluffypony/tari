@@ -28,6 +28,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use minotari_app_utilities::consts;
 use tari_comms::connection_manager::SelfLivenessStatus;
+use tari_comms::connectivity::connection_pool::ConnectionStatus;
 use tokio::time;
 
 use super::{CommandContext, HandleCommand};
@@ -107,22 +108,7 @@ impl CommandContext {
         });
         status_line.add_field("Connections", format!("{}|{}", num_nodes, num_clients));
         
-        // Add connection diagnostics
-        let mut connectivity = self.comms.connectivity();
-        if let Ok(diag) = connectivity.get_connection_pool_diagnostics().await {
-            // Add a new field with connection diagnostics
-            status_line.add_field(
-                "Conn Diag", 
-                format!(
-                    "Total: {}, Min: {}, Limits: {}|{}|{}", 
-                    diag.total_connections,
-                    diag.minimize_connections_enabled,
-                    diag.long_lived_connections,
-                    diag.daily_rotation_connections,
-                    diag.frequent_rotation_connections
-                )
-            );
-        }        
+        // Get banned peers count
         let banned_peers = self.fetch_banned_peers().await?;
         status_line.add_field("Banned", banned_peers.len());
 
@@ -131,7 +117,6 @@ impl CommandContext {
             .get_total_message_count_in_timespan(Duration::from_secs(60))
             .await?;
         status_line.add_field("Messages (last 60s)", num_messages);
-
         let num_active_rpc_sessions = self.rpc_server.get_num_active_sessions().await?;
         status_line.add_field(
             "Rpc",
@@ -165,13 +150,74 @@ impl CommandContext {
             );
         }
 
+        // Create a separate status line for connection diagnostics
+        let mut diag_line = StatusLine::new();
+        
+        // Add detailed connection diagnostics
+        let mut connectivity = self.comms.connectivity();
+        if let Ok(diag) = connectivity.get_connection_pool_diagnostics().await {
+            // Get all connection states to analyze them
+            let all_states = connectivity.get_all_connection_states().await?;
+            
+            // Count connections by status
+            let connected_count = all_states.iter().filter(|s| s.is_connected()).count();
+            let connecting_count = all_states.iter().filter(|s| s.status() == ConnectionStatus::Connecting).count();
+            let failed_count = all_states.iter().filter(|s| s.status() == ConnectionStatus::Failed).count();
+            let disconnected_count = all_states.iter().filter(|s| matches!(s.status(), ConnectionStatus::Disconnected(_))).count();
+            let not_connected_count = all_states.iter().filter(|s| s.status() == ConnectionStatus::NotConnected).count();
+            let retrying_count = all_states.iter().filter(|s| s.status() == ConnectionStatus::Retrying).count();
+            
+            // Count connections by direction
+            let inbound_count = all_states.iter()
+                .filter(|s| s.is_connected())
+                .filter(|s| s.connection().map(|c| c.direction().is_inbound()).unwrap_or(false))
+                .count();
+            let outbound_count = all_states.iter()
+                .filter(|s| s.is_connected())
+                .filter(|s| s.connection().map(|c| c.direction().is_outbound()).unwrap_or(false))
+                .count();
+            
+            diag_line.add_field(
+                "Conn States", 
+                format!(
+                    "Connected: {} (In: {}, Out: {}), Connecting: {}, Failed: {}, Disconnected: {}, NotConn: {}, Retry: {}", 
+                    connected_count,
+                    inbound_count,
+                    outbound_count,
+                    connecting_count,
+                    failed_count,
+                    disconnected_count,
+                    not_connected_count,
+                    retrying_count
+                )
+            );
+            
+            diag_line.add_field(
+                "Conn Config", 
+                format!(
+                    "Total: {}, Active: {}, Min: {}, Limits: {}|{}|{}", 
+                    diag.total_connections,
+                    connected_count,
+                    diag.minimize_connections_enabled,
+                    diag.long_lived_connections,
+                    diag.daily_rotation_connections,
+                    diag.frequent_rotation_connections
+                )
+            );
+        }
+
         let target = "base_node::app::status";
         match output {
             StatusLineOutput::StdOutAndLog => {
                 println!("{}", status_line);
+                println!("{}", diag_line);
                 log::info!(target: target, "{}", status_line);
+                log::info!(target: target, "{}", diag_line);
             },
-            StatusLineOutput::Log => log::info!(target: target, "{}", status_line),
+            StatusLineOutput::Log => {
+                log::info!(target: target, "{}", status_line);
+                log::info!(target: target, "{}", diag_line);
+            },
         };
         Ok(())
     }
