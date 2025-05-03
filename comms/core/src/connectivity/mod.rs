@@ -33,6 +33,7 @@ mod config;
 pub use config::ConnectivityConfig;
 
 mod connection_pool;
+pub use connection_pool::ConnectionStatus;
 
 mod error;
 pub use error::ConnectivityError;

@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use minotari_app_utilities::consts;
 use tari_comms::connection_manager::SelfLivenessStatus;
-use tari_comms::connectivity::connection_pool::ConnectionStatus;
+use tari_comms::connectivity::ConnectionStatus;
 use tokio::time;
 
 use super::{CommandContext, HandleCommand};
