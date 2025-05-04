@@ -113,14 +113,17 @@ impl Dht {
 
         let metrics_collector = MetricsCollector::spawn();
 
+        // Clone event_publisher before moving it into dht
+        let event_publisher_clone = event_publisher.clone();
+
         let dht = Self {
-            node_identity,
-            peer_manager,
+            node_identity: node_identity.clone(),
+            peer_manager: peer_manager.clone(),
             metrics_collector,
-            config: Arc::new(config),
+            config: Arc::new(config.clone()),
             outbound_tx,
             dht_sender,
-            connectivity,
+            connectivity: connectivity.clone(),
             discovery_sender,
             event_publisher,
         };
@@ -128,12 +131,56 @@ impl Dht {
         let conn = DbConnection::connect_and_migrate(&dht.config.database_url.clone(), MIGRATIONS)
             .map_err(DhtInitializationError::DatabaseMigrationFailed)?;
 
-        dht.network_discovery_service(shutdown_signal.clone()).spawn();
+        // Create and spawn services
+        let network_discovery = dht.network_discovery_service(shutdown_signal.clone());
+        network_discovery.spawn();
+        
         dht.connectivity_service(shutdown_signal.clone()).spawn();
         dht.actor(conn, dht_receiver, shutdown_signal.clone()).spawn();
-        dht.discovery_service(discovery_receiver, shutdown_signal).spawn();
+        dht.discovery_service(discovery_receiver, shutdown_signal.clone()).spawn();
 
         debug!(target: LOG_TARGET, "Dht initialization complete.");
+
+        // Perform bootstrap if needed
+        if config.network_discovery.enabled {
+            let peer_count = peer_manager.count().await;
+            if peer_count < config.network_discovery.min_desired_peers {
+                info!(
+                    target: LOG_TARGET, 
+                    "Node has only {} peers, which is below the minimum desired ({}) - initiating bootstrap process",
+                    peer_count,
+                    config.network_discovery.min_desired_peers
+                );
+                
+                // Create a temporary network discovery instance for bootstrapping
+                let mut bootstrap_discovery = DhtNetworkDiscovery::new(
+                    Arc::new(config),
+                    node_identity,
+                    peer_manager,
+                    connectivity,
+                    event_publisher_clone, // Use the cloned version here
+                    shutdown_signal,
+                );
+                
+                match bootstrap_discovery.bootstrap().await {
+                    Ok(stats) => {
+                        info!(
+                            target: LOG_TARGET,
+                            "Bootstrap completed successfully: added {} new peers from {} seed nodes",
+                            stats.num_new_peers,
+                            stats.num_succeeded
+                        );
+                    },
+                    Err(err) => {
+                        warn!(
+                            target: LOG_TARGET,
+                            "Bootstrap process failed: {}. Node will continue with regular peer discovery.",
+                            err
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(dht)
     }

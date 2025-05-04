@@ -99,6 +99,7 @@ impl DiscoveryReady {
             return Ok(StateEvent::BeginDiscovery(DiscoveryParams {
                 num_peers_to_request: self.config().network_discovery.max_peers_to_sync_per_round,
                 peers,
+                is_bootstrap: false,
             }));
         }
 
@@ -187,8 +188,9 @@ impl DiscoveryReady {
         }
 
         Ok(StateEvent::BeginDiscovery(DiscoveryParams {
-            num_peers_to_request: self.config().network_discovery.max_peers_to_sync_per_round,
             peers,
+            num_peers_to_request: self.config().network_discovery.max_peers_to_sync_per_round as u32,
+            is_bootstrap: false,
         }))
     }
 
@@ -196,4 +198,5 @@ impl DiscoveryReady {
     fn config(&self) -> &DhtConfig {
         &self.context.config
     }
+
 }

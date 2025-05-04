@@ -83,7 +83,6 @@ impl State {
         matches!(self, State::Shutdown)
     }
 }
-
 #[derive(Debug)]
 pub enum StateEvent {
     Initialized,
@@ -93,9 +92,9 @@ pub enum StateEvent {
     OnConnectMode,
     DiscoveryComplete(DhtNetworkDiscoveryRoundInfo),
     Errored(NetworkDiscoveryError),
+    DiscoveryFailed(NetworkDiscoveryError), // Add this variant
     Shutdown,
 }
-
 impl Display for StateEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[allow(clippy::enum_glob_use)]
@@ -107,6 +106,7 @@ impl Display for StateEvent {
             Idle => write!(f, "Idle"),
             DiscoveryComplete(stats) => write!(f, "DiscoveryComplete({})", stats),
             Errored(err) => write!(f, "Errored({})", err),
+            DiscoveryFailed(err) => write!(f, "DiscoveryFailed({})", err), // Add this case
             OnConnectMode => write!(f, "OnConnectMode"),
             Shutdown => write!(f, "Shutdown"),
         }
@@ -118,7 +118,6 @@ impl<E: Into<NetworkDiscoveryError>> From<E> for StateEvent {
         Self::Errored(err.into())
     }
 }
-
 #[derive(Debug, Clone)]
 pub(super) struct NetworkDiscoveryContext {
     pub config: Arc<DhtConfig>,
@@ -129,8 +128,8 @@ pub(super) struct NetworkDiscoveryContext {
     pub all_attempted_peers: Arc<RwLock<Vec<NodeId>>>,
     pub event_tx: broadcast::Sender<Arc<DhtEvent>>,
     pub last_round: Arc<RwLock<Option<DhtNetworkDiscoveryRoundInfo>>>,
+    pub shutdown_signal: ShutdownSignal,
 }
-
 impl NetworkDiscoveryContext {
     /// Increment the number of rounds by 1
     pub(super) fn increment_num_rounds(&self) -> usize {
@@ -188,6 +187,7 @@ impl DhtNetworkDiscovery {
                 num_rounds: Default::default(),
                 last_round: Default::default(),
                 event_tx,
+                shutdown_signal: shutdown_signal.clone(),
             },
             shutdown_signal,
         }
@@ -282,6 +282,55 @@ impl DhtNetworkDiscovery {
             }
         }
     }
+
+    pub async fn bootstrap(&mut self) -> Result<DhtNetworkDiscoveryRoundInfo, NetworkDiscoveryError> {
+        // Get seed peers
+        let seed_peers = self.context.peer_manager.get_seed_peers().await?;
+        if seed_peers.is_empty() {
+            warn!(target: LOG_TARGET, "No seed peers available for bootstrapping");
+            return Err(NetworkDiscoveryError::NoSyncPeers);
+        }
+        
+        // Create discovery params for bootstrapping
+        let params = DiscoveryParams {
+            peers: seed_peers.iter().map(|p| p.node_id.clone()).collect(),
+            num_peers_to_request: self.context.config.network_discovery.max_peers_to_sync_per_round as u32,
+            is_bootstrap: true,
+        };
+        
+        // Create a discovering state with bootstrap params
+        let mut discovering = Discovering::new(params, self.context.clone());
+        
+        // Run the discovery process
+        match discovering.next_event().await {
+            StateEvent::DiscoveryComplete(stats) => {
+                info!(
+                    target: LOG_TARGET,
+                    "Bootstrap completed: added {} new peers from {} seed nodes",
+                    stats.num_new_peers,
+                    stats.num_succeeded
+                );
+                
+                // Publish event for bootstrap completion
+                if stats.has_new_peers() {
+                    self.context.publish_event(DhtEvent::NetworkDiscoveryPeersAdded(stats.clone()));
+                }
+                
+                // Store the last round info
+                self.context.set_last_round(stats.clone()).await;
+                
+                Ok(stats)
+            },
+            StateEvent::DiscoveryFailed(err) => {
+                warn!(target: LOG_TARGET, "Bootstrap process failed: {}", err);
+                Err(err)
+            },
+            other => {
+                warn!(target: LOG_TARGET, "Unexpected state after bootstrap: {:?}", other);
+                Err(NetworkDiscoveryError::NoSyncPeers)
+            }
+        }
+    }
 }
 
 async fn or_shutdown<Fut>(shutdown_signal: ShutdownSignal, fut: Fut) -> StateEvent
@@ -291,28 +340,28 @@ where Fut: Future<Output = StateEvent> + Unpin {
         Either::Right((event, _)) => event,
     }
 }
-
 #[derive(Debug, Clone)]
 pub struct DiscoveryParams {
     pub peers: Vec<NodeId>,
     pub num_peers_to_request: u32,
+    pub is_bootstrap: bool, // Add this field
 }
 
 impl Display for DiscoveryParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "DiscoveryParams({} peer(s) ({}), num_peers_to_request = {})",
+            "DiscoveryParams({} peer(s) ({}), num_peers_to_request = {}, is_bootstrap = {})",
             self.peers.len(),
             self.peers.iter().fold(String::new(), |mut peers, p| {
                 let _ = write!(peers, "{p}, ");
                 peers
             }),
             self.num_peers_to_request,
+            self.is_bootstrap,
         )
     }
 }
-
 #[derive(Debug, Default, Clone)]
 pub struct DhtNetworkDiscoveryRoundInfo {
     pub num_new_peers: usize,

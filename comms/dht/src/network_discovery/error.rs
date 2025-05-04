@@ -27,7 +27,6 @@ use tari_comms::{
 };
 
 use crate::peer_validator::DhtPeerValidatorError;
-
 #[derive(thiserror::Error, Debug)]
 pub enum NetworkDiscoveryError {
     #[error("RPC error: {0}")]
@@ -50,4 +49,6 @@ pub enum NetworkDiscoveryError {
     DuplicatePeerReceived,
     #[error("Sync peer sent invalid peer data: {0}")]
     InvalidPeerDataReceived(anyhow::Error),
+    #[error("Operation timed out: {0}")]
+    Timeout(String),
 }
