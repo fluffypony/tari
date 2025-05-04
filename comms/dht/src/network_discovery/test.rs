@@ -266,3 +266,173 @@ mod discovery_ready {
         unpack_enum!(StateEvent::OnConnectMode = state_event);
     }
 }
+#[tokio::test]
+async fn test_bootstrap_process() {
+    // Create a mock environment
+    let node_identity = build_node_identity();
+    let peer_manager = Arc::new(PeerManager::new(HashmapDatabase::new()).unwrap());
+    let (connectivity, connectivity_mock_state) = create_connectivity_mock();
+    let (event_tx, _) = broadcast::channel(10);
+    let shutdown = Shutdown::new();
+    
+    // Create seed peers
+    let seed_peers = (0..3).map(|_| {
+        let mut peer = create_test_peer(PeerFeatures::COMMUNICATION_NODE, false);
+        peer.add_flags(PeerFlags::SEED);
+        peer
+    }).collect::<Vec<_>>();
+    
+    // Add seed peers to peer manager
+    for peer in &seed_peers {
+        peer_manager.add_peer(peer.clone()).await.unwrap();
+    }
+    
+    // Create mock RPC server that will respond with peers
+    let mock_peers = (0..10).map(|_| create_test_peer(PeerFeatures::COMMUNICATION_NODE, false)).collect::<Vec<_>>();
+    let mock_rpc = MockRpcServer::new();
+    
+    // Setup mock RPC to respond with peers
+    mock_rpc.expect_get_peers().returning(move |_| {
+        let peers = mock_peers.clone();
+        let stream = futures::stream::iter(peers.into_iter().map(|p| {
+            Ok(GetPeersResponse {
+                peer: Some(p.into()),
+            })
+        }));
+        Ok(stream)
+    });
+    
+    // Register the mock RPC service
+    connectivity_mock_state.register_service(mock_rpc.into_service());
+    
+    // Create network discovery instance
+    let mut network_discovery = DhtNetworkDiscovery::new(
+        Arc::new(DhtConfig {
+            network_discovery: NetworkDiscoveryConfig {
+                min_desired_peers: 5,
+                max_peers_to_sync_per_round: 20,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        Arc::new(node_identity),
+        peer_manager.clone(),
+        connectivity,
+        event_tx,
+        shutdown.to_signal(),
+    );
+    
+    // Run bootstrap
+    let result = network_discovery.bootstrap().await.unwrap();
+    
+    // Verify results
+    assert!(result.num_new_peers > 0, "Should have added new peers");
+    assert_eq!(result.num_succeeded, seed_peers.len(), "All seed peers should have succeeded");
+    
+    // Verify peer manager has the new peers
+    let all_peers = peer_manager.all().await.unwrap();
+    assert!(all_peers.len() > seed_peers.len(), "Should have added peers beyond the seed peers");
+    
+    // Verify connections were made to seed peers
+    let connections = connectivity_mock_state.get_connections().await;
+    for seed_peer in &seed_peers {
+        assert!(
+            connections.iter().any(|conn| conn.peer_node_id == seed_peer.node_id),
+            "Should have connected to seed peer {}",
+            seed_peer.node_id
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_bootstrap_with_no_seed_peers() {
+    // Create a mock environment with no seed peers
+    let node_identity = build_node_identity();
+    let peer_manager = Arc::new(PeerManager::new(HashmapDatabase::new()).unwrap());
+    let (connectivity, _) = create_connectivity_mock();
+    let (event_tx, _) = broadcast::channel(10);
+    let shutdown = Shutdown::new();
+    
+    // Create network discovery instance
+    let mut network_discovery = DhtNetworkDiscovery::new(
+        Arc::new(DhtConfig::default()),
+        Arc::new(node_identity),
+        peer_manager,
+        connectivity,
+        event_tx,
+        shutdown.to_signal(),
+    );
+    
+    // Run bootstrap - should fail with NoSyncPeers
+    let result = network_discovery.bootstrap().await;
+    assert!(matches!(result, Err(NetworkDiscoveryError::NoSyncPeers)));
+}
+
+#[tokio::test]
+async fn test_bootstrap_stops_when_enough_peers() {
+    // Create a mock environment
+    let node_identity = build_node_identity();
+    let peer_manager = Arc::new(PeerManager::new(HashmapDatabase::new()).unwrap());
+    let (connectivity, connectivity_mock_state) = create_connectivity_mock();
+    let (event_tx, _) = broadcast::channel(10);
+    let shutdown = Shutdown::new();
+    
+    // Create many seed peers (more than we need to try)
+    let seed_peers = (0..10).map(|_| {
+        let mut peer = create_test_peer(PeerFeatures::COMMUNICATION_NODE, false);
+        peer.add_flags(PeerFlags::SEED);
+        peer
+    }).collect::<Vec<_>>();
+    
+    // Add seed peers to peer manager
+    for peer in &seed_peers {
+        peer_manager.add_peer(peer.clone()).await.unwrap();
+    }
+    
+    // Create mock RPC server that will respond with peers
+    let mock_rpc = MockRpcServer::new();
+    
+    // Setup mock RPC to respond with 5 peers per seed
+    mock_rpc.expect_get_peers().returning(move |_| {
+        let peers = (0..5).map(|_| create_test_peer(PeerFeatures::COMMUNICATION_NODE, false)).collect::<Vec<_>>();
+        let stream = futures::stream::iter(peers.into_iter().map(|p| {
+            Ok(GetPeersResponse {
+                peer: Some(p.into()),
+            })
+        }));
+        Ok(stream)
+    });
+    
+    // Register the mock RPC service
+    connectivity_mock_state.register_service(mock_rpc.into_service());
+    
+    // Create network discovery instance with min_desired_peers = 10
+    let mut network_discovery = DhtNetworkDiscovery::new(
+        Arc::new(DhtConfig {
+            network_discovery: NetworkDiscoveryConfig {
+                min_desired_peers: 10,
+                max_peers_to_sync_per_round: 20,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        Arc::new(node_identity),
+        peer_manager.clone(),
+        connectivity,
+        event_tx,
+        shutdown.to_signal(),
+    );
+    
+    // Run bootstrap
+    let result = network_discovery.bootstrap().await.unwrap();
+    
+    // Verify results
+    assert!(result.num_new_peers >= 10, "Should have added at least 10 new peers");
+    
+    // We should have stopped after getting enough peers, not trying all seed peers
+    assert!(result.num_succeeded < seed_peers.len(), "Should not have tried all seed peers");
+    
+    // Verify peer manager has the new peers
+    let all_peers = peer_manager.all().await.unwrap();
+    assert!(all_peers.len() >= 10 + seed_peers.len(), "Should have at least 10 new peers plus seed peers");
+}
