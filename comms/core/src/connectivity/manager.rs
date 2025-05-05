@@ -155,6 +155,23 @@ impl fmt::Display for ConnectivityStatus {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ConnectionPoolDiagnostics {
+    pub total_connections: usize,
+    pub connected_nodes: usize,
+    pub connected_clients: usize,
+    pub failed_connections: usize,
+    pub disconnected_connections: usize,
+    pub minimize_connections_enabled: bool,
+    pub minimize_connections_threshold: Option<usize>,
+    pub connection_reaping_enabled: bool,
+    pub reaper_min_connection_threshold: usize,
+    pub long_lived_connections: usize,
+    pub daily_rotation_connections: usize,
+    pub frequent_rotation_connections: usize,
+    pub allow_list_size: usize,
+}
+
 struct ConnectivityManagerActor {
     config: ConnectivityConfig,
     status: ConnectivityStatus,
@@ -179,6 +196,24 @@ impl ConnectivityManagerActor {
         tokio::spawn(async { Self::run(self).await })
     }
 
+    pub fn get_connection_pool_diagnostics(&self) -> ConnectionPoolDiagnostics {
+        ConnectionPoolDiagnostics {
+            total_connections: self.pool.count_entries(),
+            connected_nodes: self.pool.count_connected_nodes(),
+            connected_clients: self.pool.count_connected_clients(),
+            failed_connections: self.pool.count_failed(),
+            disconnected_connections: self.pool.count_disconnected(),
+            minimize_connections_enabled: self.config.maintain_n_closest_connections_only.is_some(),
+            minimize_connections_threshold: self.config.maintain_n_closest_connections_only,
+            connection_reaping_enabled: self.config.is_connection_reaping_enabled,
+            reaper_min_connection_threshold: self.config.reaper_min_connection_threshold,
+            long_lived_connections: self.config.long_lived_connections,
+            daily_rotation_connections: self.config.daily_rotation_connections,
+            frequent_rotation_connections: self.config.frequent_rotation_connections,
+            allow_list_size: self.allow_list.len(),
+        }
+    }
+    
     pub async fn run(mut self) {
         debug!(target: LOG_TARGET, "ConnectivityManager started");
 
