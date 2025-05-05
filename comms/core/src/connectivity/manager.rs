@@ -364,12 +364,60 @@ impl ConnectivityManagerActor {
             },
         }
     }
+    // Check if we're at the connection limit
+    async fn check_connection_limit(&self) -> Result<bool, ConnectivityError> {
+        // Get all outbound connections
+        let outbound_connections = self.pool
+                    .filter_connection_states(|state| 
+                        state.is_connected() && 
+                        state.connection().map_or(false, |conn| conn.direction().is_outbound())
+                    )
+            .len();
+        
+        // Calculate the maximum allowed connections
+        let max_connections = self.config.long_lived_connections + 
+                            self.config.daily_rotation_connections + 
+                            self.config.frequent_rotation_connections;
+        
+        // Return whether we're under the limit
+        Ok(outbound_connections < max_connections)
+    }
 
     async fn handle_dial_peer(
         &mut self,
         node_id: NodeId,
         reply_tx: Option<oneshot::Sender<Result<PeerConnection, ConnectionManagerError>>>,
     ) {
+        // Check if we're already at the connection limit
+        match self.check_connection_limit().await {
+            Ok(under_limit) => {
+                if !under_limit {
+                    debug!(
+                        target: LOG_TARGET,
+                        "Not connecting to peer {} as we're already at the connection limit of {}", 
+                        node_id,
+                        self.config.long_lived_connections + 
+                        self.config.daily_rotation_connections + 
+                        self.config.frequent_rotation_connections
+                    );
+                    if let Some(reply) = reply_tx {
+                        let _ = reply.send(Err(ConnectionManagerError::ConnectivityError(
+                            Box::new(ConnectivityError::ConnectionLimitReached)
+                        )));
+                    }
+                    return;
+                }
+            },
+            Err(err) => {
+                error!(
+                    target: LOG_TARGET,
+                    "Failed to check connection limit: {}", err
+                );
+                let _ = reply_tx.map(|tx| tx.send(Err(ConnectionManagerError::ConnectivityError(Box::new(err)))));
+                return;
+            }
+        }
+
         match self.peer_manager.is_peer_banned(&node_id).await {
             Ok(true) => {
                 if let Some(reply) = reply_tx {
@@ -1347,42 +1395,4 @@ async fn disconnect_silent_with_timeout(
             Err(PeerConnectionError::DisconnectTimeout)
         },
     }
-}
-impl ConnectivityManagerActor {
-    // Add this new method
-    pub fn get_connection_pool_diagnostics(&self) -> ConnectionPoolDiagnostics {
-        ConnectionPoolDiagnostics {
-            total_connections: self.pool.count_entries(),
-            connected_nodes: self.pool.count_connected_nodes(),
-            connected_clients: self.pool.count_connected_clients(),
-            failed_connections: self.pool.count_failed(),
-            disconnected_connections: self.pool.count_disconnected(),
-            minimize_connections_enabled: self.config.maintain_n_closest_connections_only.is_some(),
-            minimize_connections_threshold: self.config.maintain_n_closest_connections_only,
-            connection_reaping_enabled: self.config.is_connection_reaping_enabled,
-            reaper_min_connection_threshold: self.config.reaper_min_connection_threshold,
-            long_lived_connections: self.config.long_lived_connections,
-            daily_rotation_connections: self.config.daily_rotation_connections,
-            frequent_rotation_connections: self.config.frequent_rotation_connections,
-            allow_list_size: self.allow_list.len(),
-        }
-    }
-}
-
-// Add this struct to the file
-#[derive(Debug, Clone)]
-pub struct ConnectionPoolDiagnostics {
-    pub total_connections: usize,
-    pub connected_nodes: usize,
-    pub connected_clients: usize,
-    pub failed_connections: usize,
-    pub disconnected_connections: usize,
-    pub minimize_connections_enabled: bool,
-    pub minimize_connections_threshold: Option<usize>,
-    pub connection_reaping_enabled: bool,
-    pub reaper_min_connection_threshold: usize,
-    pub long_lived_connections: usize,
-    pub daily_rotation_connections: usize,
-    pub frequent_rotation_connections: usize,
-    pub allow_list_size: usize,
 }
