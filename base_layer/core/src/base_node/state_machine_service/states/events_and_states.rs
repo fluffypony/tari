@@ -183,6 +183,7 @@ impl Display for BaseNodeState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateInfo {
     StartUp,
+    Bootstrapping(BootstrapInfo),
     Connecting(SyncPeer),
     HeaderSync(Option<BlockSyncInfo>),
     HorizonSync(HorizonSyncInfo),
@@ -191,12 +192,48 @@ pub enum StateInfo {
     Listening(ListeningInfo),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BootstrapInfo {
+    pub stage: BootstrapStage,
+    pub current_seed: Option<usize>,
+    pub total_seeds: usize,
+    pub peers_found: usize,
+    pub target_peers: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BootstrapStage {
+    Starting,
+    ConnectingToSeeds,
+    GettingPeersFromSeed,
+    Completed,
+    Failed(String),
+}
+
 impl StateInfo {
     pub fn short_desc(&self) -> String {
         #[allow(clippy::enum_glob_use)]
         use StateInfo::*;
         match self {
             StartUp => "Starting up".to_string(),
+            Bootstrapping(info) => match &info.stage {
+                BootstrapStage::Starting => "Initializing bootstrap".to_string(),
+                BootstrapStage::ConnectingToSeeds => format!("Connecting to {} seed nodes", info.total_seeds),
+                BootstrapStage::GettingPeersFromSeed => {
+                    if let Some(current) = info.current_seed {
+                        format!(
+                            "Getting peers from seed {}/{} ({} peers found)", 
+                            current + 1, 
+                            info.total_seeds,
+                            info.peers_found
+                        )
+                    } else {
+                        "Getting peers from seeds".to_string()
+                    }
+                },
+                BootstrapStage::Completed => format!("Bootstrap complete: {} peers found", info.peers_found),
+                BootstrapStage::Failed(reason) => format!("Bootstrap failed: {}", reason),
+            },
             Connecting(sync_peer) => format!(
                 "Connecting to {}{}",
                 sync_peer.node_id().short_str(),
@@ -236,7 +273,7 @@ impl StateInfo {
         #[allow(clippy::enum_glob_use)]
         use StateInfo::*;
         match self {
-            StartUp | Connecting(_) | HeaderSync(_) | HorizonSync(_) | BlockSync(_) | SyncFailed(_) => false,
+            StartUp | Bootstrapping(_) | Connecting(_) | HeaderSync(_) | HorizonSync(_) | BlockSync(_) | SyncFailed(_) => false,
             Listening(info) => info.is_synced(),
         }
     }
@@ -249,12 +286,44 @@ impl StateInfo {
     }
 }
 
+// Display implementation for BootstrapInfo
+impl Display for BootstrapInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        match &self.stage {
+            BootstrapStage::Starting => write!(f, "Initializing bootstrap process"),
+            BootstrapStage::ConnectingToSeeds => write!(f, "Connecting to seed nodes ({} available)", self.total_seeds),
+            BootstrapStage::GettingPeersFromSeed => {
+                if let Some(current) = self.current_seed {
+                    write!(
+                        f, 
+                        "Getting peers from seed {} of {} (found {} of {} peers)", 
+                        current + 1, 
+                        self.total_seeds,
+                        self.peers_found,
+                        self.target_peers
+                    )
+                } else {
+                    write!(f, "Getting peers from seeds")
+                }
+            },
+            BootstrapStage::Completed => write!(
+                f, 
+                "Bootstrap complete: found {} peers from {} seed nodes", 
+                self.peers_found, 
+                self.total_seeds
+            ),
+            BootstrapStage::Failed(reason) => write!(f, "Bootstrap failed: {}", reason),
+        }
+    }
+}
+
 impl Display for StateInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         #[allow(clippy::enum_glob_use)]
         use StateInfo::*;
         match self {
             StartUp => write!(f, "Node starting up"),
+            Bootstrapping(info) => write!(f, "Bootstrapping: {}", info),
             Connecting(sync_peer) => write!(f, "Connecting to {}", sync_peer),
             HeaderSync(Some(info)) => write!(f, "Synchronizing block headers: {}", info),
             HeaderSync(None) => write!(f, "Synchronizing block headers: Starting"),
@@ -265,7 +334,6 @@ impl Display for StateInfo {
         }
     }
 }
-
 /// This struct contains global state machine state and the info specific to the current State
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusInfo {

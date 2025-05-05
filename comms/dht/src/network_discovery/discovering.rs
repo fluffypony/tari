@@ -42,6 +42,7 @@ use crate::{
     rpc,
     rpc::UnvalidatedPeerInfo,
     DhtConfig,
+    event::DhtEvent
 };
 
 const LOG_TARGET: &str = "comms::dht::network_discovery";
@@ -158,21 +159,38 @@ impl Discovering {
         info!(target: LOG_TARGET, "Found {} seed peers for bootstrapping", seed_peers.len());
         
         let mut stats = DhtNetworkDiscoveryRoundInfo::default();
+        let target_peers = self.config().network_discovery.min_desired_peers;
         
         // Connect to each seed peer, get their peers, then disconnect
-        for seed_peer in seed_peers {
+        for (i, seed_peer) in seed_peers.iter().enumerate() {
             if self.context.shutdown_signal.is_triggered() {
                 break;
             }
             
-            match self.bootstrap_from_seed(&seed_peer).await {
+            // Publish progress event
+            self.context.publish_event(DhtEvent::BootstrapProgress {
+                current_seed: i,
+                total_seeds: seed_peers.len(),
+                peers_found: stats.num_new_peers,
+                target_peers,
+            });
+            
+            match self.bootstrap_from_seed(seed_peer).await {
                 Ok(num_peers) => {
                     stats.num_new_peers += num_peers;
                     stats.num_succeeded += 1;
                     stats.sync_peers.push(seed_peer.node_id.clone());
                     
+                    // Publish updated progress
+                    self.context.publish_event(DhtEvent::BootstrapProgress {
+                        current_seed: i,
+                        total_seeds: seed_peers.len(),
+                        peers_found: stats.num_new_peers,
+                        target_peers,
+                    });
+                    
                     // If we have enough peers, we can stop bootstrapping
-                    if stats.num_new_peers >= self.config().network_discovery.min_desired_peers {
+                    if stats.num_new_peers >= target_peers {
                         info!(
                             target: LOG_TARGET, 
                             "Bootstrap complete: reached minimum desired peers ({}) after {} seed nodes",

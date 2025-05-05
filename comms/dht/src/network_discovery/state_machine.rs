@@ -288,8 +288,18 @@ impl DhtNetworkDiscovery {
         let seed_peers = self.context.peer_manager.get_seed_peers().await?;
         if seed_peers.is_empty() {
             warn!(target: LOG_TARGET, "No seed peers available for bootstrapping");
+            
+            // Publish bootstrap failed event
+            self.context.publish_event(DhtEvent::BootstrapFailed("No seed peers available".into()));
+            
             return Err(NetworkDiscoveryError::NoSyncPeers);
         }
+        
+        // Publish bootstrap started event
+        self.context.publish_event(DhtEvent::BootstrapStarted {
+            total_seeds: seed_peers.len(),
+            target_peers: self.context.config.network_discovery.min_desired_peers,
+        });
         
         // Create discovery params for bootstrapping
         let params = DiscoveryParams {
@@ -312,6 +322,11 @@ impl DhtNetworkDiscovery {
                 );
                 
                 // Publish event for bootstrap completion
+                self.context.publish_event(DhtEvent::BootstrapCompleted {
+                    peers_found: stats.num_new_peers,
+                    seeds_used: stats.num_succeeded,
+                });
+                
                 if stats.has_new_peers() {
                     self.context.publish_event(DhtEvent::NetworkDiscoveryPeersAdded(stats.clone()));
                 }
@@ -323,10 +338,18 @@ impl DhtNetworkDiscovery {
             },
             StateEvent::DiscoveryFailed(err) => {
                 warn!(target: LOG_TARGET, "Bootstrap process failed: {}", err);
+                
+                // Publish bootstrap failed event
+                self.context.publish_event(DhtEvent::BootstrapFailed(err.to_string()));
+                
                 Err(err)
             },
             other => {
                 warn!(target: LOG_TARGET, "Unexpected state after bootstrap: {:?}", other);
+                
+                // Publish bootstrap failed event
+                self.context.publish_event(DhtEvent::BootstrapFailed("Unexpected state transition".into()));
+                
                 Err(NetworkDiscoveryError::NoSyncPeers)
             }
         }

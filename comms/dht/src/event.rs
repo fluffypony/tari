@@ -30,7 +30,7 @@ pub type DhtEventSender = broadcast::Sender<Arc<DhtEvent>>;
 pub type DhtEventReceiver = broadcast::Receiver<Arc<DhtEvent>>;
 
 /// Events emitted by the DHT actor.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DhtEvent {
     /// Emitted by the store and forward service upon receipt of a sufficient number of store and forward messages
@@ -38,4 +38,21 @@ pub enum DhtEvent {
 
     /// Emitted by the NetworkDiscovery actor once a round of peer syncing has completed.
     NetworkDiscoveryPeersAdded(DhtNetworkDiscoveryRoundInfo),
+    
+    // Add these new events
+    BootstrapStarted {
+        total_seeds: usize,
+        target_peers: usize,
+    },
+    BootstrapProgress {
+        current_seed: usize,
+        total_seeds: usize,
+        peers_found: usize,
+        target_peers: usize,
+    },
+    BootstrapCompleted {
+        peers_found: usize,
+        seeds_used: usize,
+    },
+    BootstrapFailed(String),
 }
