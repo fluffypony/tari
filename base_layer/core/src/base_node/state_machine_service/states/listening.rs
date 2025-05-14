@@ -190,7 +190,14 @@ impl Listening {
                         },
                         Ok(false) => {},
                         Err(e) => {
-                            return FatalError(format!("Error checking if peer is banned: {}", e));
+                            // Log the error but don't treat it as fatal
+                            warn!(
+                                target: LOG_TARGET,
+                                "Error checking if peer {} is banned: {}. Assuming not banned.",
+                                peer_metadata.node_id(),
+                                e
+                            );
+                            // Continue processing as if the peer is not banned
                         },
                     }
 
