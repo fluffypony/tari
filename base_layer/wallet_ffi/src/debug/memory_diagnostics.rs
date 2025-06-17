@@ -4,15 +4,14 @@
 //! at FFI boundaries, particularly in Node.js integration scenarios.
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
+    alloc::Layout,
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}},
-    ptr,
+    sync::{Mutex, atomic::{AtomicUsize, Ordering}},
     mem,
-    ffi::{CStr, CString},
+    ffi::CStr,
     os::raw::{c_char, c_void},
 };
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 
 /// Global memory tracking state
 static MEMORY_TRACKER: Mutex<Option<MemoryTracker>> = Mutex::new(None);
@@ -87,6 +86,7 @@ impl MemoryTracker {
                     source,
                 };
 
+                let source = info.source.clone();
                 tracker.allocations.insert(ptr as usize, info);
                 let new_total = tracker.total_allocated.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
                 
@@ -98,7 +98,7 @@ impl MemoryTracker {
                 
                 tracker.allocation_count.fetch_add(1, Ordering::Relaxed);
 
-                debug!("ALLOC: {:?} bytes at {:p} from {:?}", layout.size(), ptr, info.source);
+                debug!("ALLOC: {:?} bytes at {:p} from {:?}", layout.size(), ptr, source);
             }
         }
     }

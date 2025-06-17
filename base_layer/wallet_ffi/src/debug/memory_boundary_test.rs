@@ -10,7 +10,7 @@ use std::{
     mem,
     slice,
 };
-use log::{debug, error, info, warn};
+use log::{debug, info};
 
 /// Memory boundary test suite
 pub struct MemoryBoundaryTest;
@@ -255,7 +255,8 @@ impl MemoryBoundaryTest {
             let handle = thread::spawn(move || {
                 for j in 0..100 {
                     let mut guard = data.lock().unwrap();
-                    guard[j % guard.len()] = (i * j) as u8;
+                    let index = j % guard.len();
+                    guard[index] = (i * j) as u8;
                     // Simulate some work
                     thread::yield_now();
                 }

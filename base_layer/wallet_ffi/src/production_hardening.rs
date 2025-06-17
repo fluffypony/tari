@@ -4,10 +4,10 @@
 //! to prevent and handle segfaults in production environments.
 
 use std::{
-    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
+    sync::{Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
     time::{Duration, Instant},
     thread,
-    panic::{self, PanicInfo},
+    panic::{self, PanicHookInfo},
 };
 use log::{debug, error, info, warn};
 
@@ -93,7 +93,7 @@ impl ProductionHardening {
     fn install_crash_handlers() {
         // Install panic handler
         let original_hook = panic::take_hook();
-        panic::set_hook(Box::new(move |panic_info: &PanicInfo| {
+        panic::set_hook(Box::new(move |panic_info: &PanicHookInfo| {
             Self::handle_crash(panic_info);
             original_hook(panic_info);
         }));
@@ -139,7 +139,7 @@ impl ProductionHardening {
     }
 
     /// Handle panic crashes
-    fn handle_crash(panic_info: &PanicInfo) {
+    fn handle_crash(panic_info: &PanicHookInfo) {
         error!("=== PANIC DETECTED ===");
         error!("Panic info: {}", panic_info);
         
@@ -189,7 +189,7 @@ impl ProductionHardening {
 
     /// Start resource monitoring thread
     fn start_resource_monitor() {
-        thread::Builder::new()
+        let _handle = thread::Builder::new()
             .name("resource-monitor".to_string())
             .spawn(|| {
                 info!("Resource monitoring thread started");
@@ -203,16 +203,17 @@ impl ProductionHardening {
                                 break;
                             }
                             
-                            Self::check_system_health();
+                            ProductionHardening::check_system_health();
                         }
                     }
                 }
                 
                 info!("Resource monitoring thread stopped");
-            })
-            .unwrap_or_else(|e| {
-                error!("Failed to start resource monitor: {}", e);
             });
+            
+        if _handle.is_err() {
+            error!("Failed to start resource monitor: {:?}", _handle.unwrap_err());
+        }
     }
 
     /// Check system health
@@ -508,7 +509,7 @@ impl<T> GracefulOperation<T> {
 #[macro_export]
 macro_rules! graceful_operation {
     ($operation:expr, $timeout:expr, $description:expr) => {{
-        use $crate::base_layer::wallet_ffi::src::production_hardening::GracefulOperation;
+        use $crate::production_hardening::GracefulOperation;
         GracefulOperation::new($operation, $timeout, $description.to_string()).execute()
     }};
 }

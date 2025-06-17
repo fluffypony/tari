@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::runtime::{Builder, Handle, Runtime};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 
 /// Runtime strategy enumeration for testing different approaches
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,7 +25,7 @@ pub enum RuntimeStrategy {
 }
 
 /// Runtime test results
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RuntimeTestResult {
     pub strategy: RuntimeStrategy,
     pub success: bool,
@@ -347,9 +347,11 @@ pub async fn run_compatibility_test() -> RuntimeTestResult {
     info!("{}", tester.generate_report());
     
     // Return best result or first successful one
-    results.into_iter()
+    let best_result = results.iter()
         .find(|r| r.success && !r.event_loop_conflicts)
-        .or_else(|| results.into_iter().find(|r| r.success))
+        .cloned();
+    
+    best_result.or_else(|| results.iter().find(|r| r.success).cloned())
         .unwrap_or(RuntimeTestResult {
             strategy: RuntimeStrategy::MultiThreaded,
             success: false,

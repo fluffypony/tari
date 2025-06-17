@@ -59,6 +59,7 @@ default = []
 debug_memory = ["backtrace", "env_logger"]
 debug_runtime = ["env_logger"]
 nodejs_compatibility = []
+tokio-metrics = []
 
 [dev-dependencies]
 once_cell = "1.8.0"

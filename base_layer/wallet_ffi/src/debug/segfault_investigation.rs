@@ -5,10 +5,10 @@
 
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
-    panic::{self, PanicInfo},
-    sync::{Arc, Mutex},
+    panic::{self, PanicHookInfo},
+    sync::Mutex,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 use log::{error, info, warn};
 
@@ -59,7 +59,7 @@ impl SegfaultInvestigator {
 
     /// Install comprehensive panic handler with backtrace
     fn install_panic_handler() {
-        panic::set_hook(Box::new(|panic_info: &PanicInfo| {
+        panic::set_hook(Box::new(|panic_info: &PanicHookInfo| {
             let backtrace = Backtrace::capture();
             let thread = thread::current();
             let thread_name = thread.name().unwrap_or("unnamed");
@@ -257,6 +257,7 @@ macro_rules! debug_nodejs_ffi {
 
 /// Initialize debugging for tests
 pub fn init_test_debugging() {
+    #[cfg(feature = "env_logger")]
     let _ = env_logger::try_init();
     let _ = SegfaultInvestigator::initialize();
 }

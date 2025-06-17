@@ -59,7 +59,6 @@ pub struct ThreadedRuntime {
 }
 
 /// Task for threaded runtime execution
-#[derive(Debug)]
 struct ThreadedTask {
     task: Box<dyn FnOnce() + Send>,
     result_sender: mpsc::Sender<Result<(), String>>,
@@ -109,7 +108,7 @@ impl RuntimeManager {
     }
 
     /// Get or create runtime manager instance
-    pub fn get_instance() -> Result<Arc<Mutex<RuntimeManager>>, String> {
+    pub fn get_instance() -> Result<Arc<Mutex<Option<RuntimeManager>>>, String> {
         Self::initialize().map_err(|e| format!("Failed to initialize runtime manager: {}", e))?;
         
         let strategy_mgr = RUNTIME_STRATEGY.get()
@@ -330,7 +329,7 @@ impl RuntimeManager {
     {
         match handle {
             RuntimeHandle::Runtime(rt) => {
-                rt.block_on(future).into()
+                Ok(rt.block_on(future))
             }
             RuntimeHandle::Handle(h) => {
                 // For handle-based execution, we need to spawn and wait
@@ -428,8 +427,11 @@ where
     T: Send + 'static,
 {
     let manager_arc = RuntimeManager::get_instance()?;
-    let manager = manager_arc.lock().unwrap();
-    manager.block_on(future)
+    let guard = manager_arc.lock().unwrap();
+    match guard.as_ref() {
+        Some(manager) => manager.block_on(future),
+        None => Err("Runtime manager not initialized".to_string()),
+    }
 }
 
 /// Initialize runtime strategies with specific strategy

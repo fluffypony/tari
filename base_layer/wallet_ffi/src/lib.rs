@@ -6807,8 +6807,9 @@ pub unsafe extern "C" fn wallet_create(
     {
         use crate::debug::memory_diagnostics::FFIBoundaryValidator;
         
-        if let Err(e) = FFIBoundaryValidator::validate_pointer_alignment(error_out) {
-            error!(target: "tari::wallet_ffi", "Critical parameter validation failed: {:?}", e.errors);
+        let validation = FFIBoundaryValidator::validate_pointer_alignment(error_out);
+        if !validation.valid {
+            error!(target: "tari::wallet_ffi", "Critical parameter validation failed: {:?}", validation.errors);
             // Can't set error_out if it's invalid, so we must return immediately
             return ptr::null_mut();
         }
@@ -6825,14 +6826,16 @@ pub unsafe extern "C" fn wallet_create(
         use crate::debug::memory_diagnostics::FFIBoundaryValidator;
         
         // Validate critical pointers
-        if let Err(e) = FFIBoundaryValidator::validate_pointer_alignment(error_out) {
-            error!(target: "tari::wallet_ffi", "error_out pointer validation failed: {:?}", e.errors);
+        let validation = FFIBoundaryValidator::validate_pointer_alignment(error_out);
+        if !validation.valid {
+            error!(target: "tari::wallet_ffi", "error_out pointer validation failed: {:?}", validation.errors);
             return ptr::null_mut();
         }
         
         if !log_path.is_null() {
-            if let Err(e) = FFIBoundaryValidator::validate_c_string(log_path) {
-                error!(target: "tari::wallet_ffi", "log_path validation failed: {:?}", e.errors);
+            let validation = FFIBoundaryValidator::validate_c_string(log_path);
+            if !validation.valid {
+                error!(target: "tari::wallet_ffi", "log_path validation failed: {:?}", validation.errors);
                 *error_out = LibWalletError::from(InterfaceError::InvalidArgument("Invalid log_path".to_string())).code;
                 return ptr::null_mut();
             }
@@ -6975,7 +6978,7 @@ pub unsafe extern "C" fn wallet_create(
     let runtime = {
         #[cfg(feature = "nodejs_compatibility")]
         {
-            use crate::runtime_strategies::{execute_with_runtime, initialize_runtime_with_strategy, RuntimeStrategy};
+            use crate::runtime_strategies::{initialize_runtime_with_strategy, RuntimeStrategy};
             
             debug!(target: "tari::wallet_ffi", "Using Node.js compatible runtime strategy");
             
@@ -7373,8 +7376,9 @@ pub unsafe extern "C" fn wallet_create(
                 use crate::debug::memory_diagnostics::{FFIBoundaryValidator, generate_memory_report};
                 
                 // Validate return pointer
-                if let Err(e) = FFIBoundaryValidator::validate_pointer_alignment(wallet_ptr) {
-                    error!(target: "tari::wallet_ffi", "Return pointer validation failed: {:?}", e.errors);
+                let validation = FFIBoundaryValidator::validate_pointer_alignment(wallet_ptr);
+                if !validation.valid {
+                    error!(target: "tari::wallet_ffi", "Return pointer validation failed: {:?}", validation.errors);
                     // Clean up the allocation since we can't return it safely
                     unsafe { 
                         let _ = Box::from_raw(wallet_ptr);
