@@ -71,6 +71,10 @@ mod debug_segfault_investigation;
 // Memory safety checking utilities
 #[cfg(feature = "debug_memory")]
 mod debug_memory_safety;
+
+// Alternative runtime strategies for Node.js compatibility
+#[cfg(feature = "nodejs_compatibility")]
+mod runtime_strategies;
 use ffi_basenode_state::TariBaseNodeState;
 use itertools::Itertools;
 use libc::{c_char, c_int, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
@@ -6956,25 +6960,54 @@ pub unsafe extern "C" fn wallet_create(
         }
     }
     
-    debug!(target: "tari::wallet_ffi", "Attempting to create Tokio runtime for wallet_create");
+    debug!(target: "tari::wallet_ffi", "Creating Tokio runtime for wallet_create");
     
-    let runtime = match Runtime::new() {
-        Ok(r) => {
-            debug!(target: "tari::wallet_ffi", "Tokio runtime created successfully");
-            r
-        },
-        Err(e) => {
-            error!(target: "tari::wallet_ffi", "Tokio runtime creation failed: {}", e);
-            #[cfg(feature = "debug_runtime")]
-            {
-                error!(target: "tari::wallet_ffi", "Runtime creation failure may be due to Node.js event loop conflicts");
-                if debug_segfault_investigation::NodeJsDetector::is_potential_nodejs_thread() {
-                    error!(target: "tari::wallet_ffi", "Failure occurred on potential Node.js thread");
+    // Use enhanced runtime creation strategy for Node.js compatibility
+    let runtime = {
+        #[cfg(feature = "nodejs_compatibility")]
+        {
+            debug!(target: "tari::wallet_ffi", "Using Node.js compatible runtime strategy");
+            let selector = runtime_strategies::RuntimeSelector::new();
+            match selector.create_runtime_with_fallback() {
+                Ok(runtime_strategies::RuntimeWrapper::Owned(runtime)) => {
+                    info!(target: "tari::wallet_ffi", "Runtime created successfully with Node.js compatible strategy");
+                    runtime
+                },
+                Ok(_) => {
+                    error!(target: "tari::wallet_ffi", "Non-owned runtime strategy not supported for wallet_create");
+                    *error_out = LibWalletError::from(InterfaceError::TokioError("Unsupported runtime strategy".to_string())).code;
+                    return ptr::null_mut();
+                },
+                Err(e) => {
+                    error!(target: "tari::wallet_ffi", "All Node.js compatible runtime strategies failed: {}", e);
+                    *error_out = LibWalletError::from(InterfaceError::TokioError(e)).code;
+                    return ptr::null_mut();
                 }
             }
-            *error_out = LibWalletError::from(InterfaceError::TokioError(e.to_string())).code;
-            return ptr::null_mut();
-        },
+        }
+        
+        #[cfg(not(feature = "nodejs_compatibility"))]
+        {
+            debug!(target: "tari::wallet_ffi", "Using standard runtime creation");
+            match Runtime::new() {
+                Ok(r) => {
+                    debug!(target: "tari::wallet_ffi", "Standard runtime created successfully");
+                    r
+                },
+                Err(e) => {
+                    error!(target: "tari::wallet_ffi", "Standard runtime creation failed: {}", e);
+                    #[cfg(feature = "debug_runtime")]
+                    {
+                        error!(target: "tari::wallet_ffi", "Runtime creation failure may be due to Node.js event loop conflicts");
+                        if debug_segfault_investigation::NodeJsDetector::is_potential_nodejs_thread() {
+                            error!(target: "tari::wallet_ffi", "Failure occurred on potential Node.js thread");
+                        }
+                    }
+                    *error_out = LibWalletError::from(InterfaceError::TokioError(e.to_string())).code;
+                    return ptr::null_mut();
+                }
+            }
+        }
     };
     let factories = CryptoFactories::default();
 
