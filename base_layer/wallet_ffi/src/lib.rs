@@ -67,6 +67,10 @@ use error::LibWalletError;
 // Debug infrastructure for segfault investigation
 #[cfg(feature = "debug_runtime")]
 mod debug_segfault_investigation;
+
+// Memory safety checking utilities
+#[cfg(feature = "debug_memory")]
+mod debug_memory_safety;
 use ffi_basenode_state::TariBaseNodeState;
 use itertools::Itertools;
 use libc::{c_char, c_int, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
@@ -6795,10 +6799,44 @@ pub unsafe extern "C" fn wallet_create(
 ) -> *mut TariWallet {
     use tari_key_manager::mnemonic::Mnemonic;
 
+    // Enhanced parameter validation with memory safety checks
+    #[cfg(feature = "debug_memory")]
+    {
+        if let Err(e) = debug_memory_safety::FfiMemorySafetyChecker::validate_c_mut_pointer(error_out, "error_out") {
+            error!(target: "tari::wallet_ffi", "Critical parameter validation failed: {}", e);
+            // Can't set error_out if it's invalid, so we must return immediately
+            return ptr::null_mut();
+        }
+    }
+
     if error_out.is_null() {
         return ptr::null_mut();
     }
     *error_out = 0;
+
+    // Additional parameter validation with memory safety
+    #[cfg(feature = "debug_memory")]
+    {
+        if let Err(e) = debug_memory_safety::FfiMemorySafetyChecker::validate_wallet_create_params(
+            context,
+            config as *const std::ffi::c_void,
+            log_path,
+            passphrase,
+            seed_passphrase,
+            network_str,
+            dns_seeds_str,
+            dns_seed_name_servers_str,
+            recovery_in_progress,
+            error_out,
+        ) {
+            error!(target: "tari::wallet_ffi", "Parameter validation failed: {}", e);
+            *error_out = LibWalletError::from(InterfaceError::InvalidArgument(e)).code;
+            return ptr::null_mut();
+        }
+        
+        debug_memory_safety::NodeJsMemoryGuard::apply_nodejs_protections();
+        debug_memory_safety::FfiMemorySafetyChecker::check_memory_state_before_runtime_creation();
+    }
 
     if config.is_null() {
         *error_out = LibWalletError::from(InterfaceError::NullError("config".to_string())).code;
@@ -7277,7 +7315,27 @@ pub unsafe extern "C" fn wallet_create(
                 context,
             };
 
-            Box::into_raw(Box::new(tari_wallet))
+            let wallet_ptr = Box::into_raw(Box::new(tari_wallet));
+            
+            // Final memory safety validation
+            #[cfg(feature = "debug_memory")]
+            {
+                debug_memory_safety::FfiMemorySafetyChecker::check_memory_state_after_wallet_creation();
+                
+                if let Err(e) = debug_memory_safety::FfiMemorySafetyChecker::validate_return_pointer(wallet_ptr, "TariWallet") {
+                    error!(target: "tari::wallet_ffi", "Return pointer validation failed: {}", e);
+                    // Clean up the allocation since we can't return it safely
+                    unsafe { 
+                        let _ = Box::from_raw(wallet_ptr);
+                    }
+                    *error_out = LibWalletError::from(InterfaceError::PointerError(e)).code;
+                    return ptr::null_mut();
+                }
+                
+                info!(target: "tari::wallet_ffi", "Wallet creation completed successfully with all safety checks passed");
+            }
+            
+            wallet_ptr
         },
         Err(e) => {
             *error_out = LibWalletError::from(e).code;
