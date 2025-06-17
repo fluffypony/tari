@@ -75,6 +75,9 @@ mod debug_memory_safety;
 // Alternative runtime strategies for Node.js compatibility
 #[cfg(feature = "nodejs_compatibility")]
 mod runtime_strategies;
+
+// Production hardening and error recovery
+mod production_hardening;
 use ffi_basenode_state::TariBaseNodeState;
 use itertools::Itertools;
 use libc::{c_char, c_int, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
@@ -6842,6 +6845,11 @@ pub unsafe extern "C" fn wallet_create(
         debug_memory_safety::FfiMemorySafetyChecker::check_memory_state_before_runtime_creation();
     }
 
+    // Initialize production safety systems
+    production_hardening::initialize_global_safety();
+    let safety_resource_id = production_hardening::get_global_safety()
+        .register_resource("wallet_create_session".to_string(), None);
+
     if config.is_null() {
         *error_out = LibWalletError::from(InterfaceError::NullError("config".to_string())).code;
         return ptr::null_mut();
@@ -6980,6 +6988,15 @@ pub unsafe extern "C" fn wallet_create(
                 },
                 Err(e) => {
                     error!(target: "tari::wallet_ffi", "All Node.js compatible runtime strategies failed: {}", e);
+                    
+                    // Attempt error recovery
+                    if production_hardening::get_global_safety()
+                        .handle_critical_error("runtime_creation_failure", &e) {
+                        // Recovery attempted, but still need to fail gracefully
+                        warn!(target: "tari::wallet_ffi", "Runtime creation recovery attempted but failed");
+                    }
+                    
+                    production_hardening::get_global_safety().unregister_resource(safety_resource_id);
                     *error_out = LibWalletError::from(InterfaceError::TokioError(e)).code;
                     return ptr::null_mut();
                 }
@@ -7367,6 +7384,16 @@ pub unsafe extern "C" fn wallet_create(
                 
                 info!(target: "tari::wallet_ffi", "Wallet creation completed successfully with all safety checks passed");
             }
+            
+            // Register wallet as a managed resource
+            let _wallet_resource_id = production_hardening::get_global_safety()
+                .register_resource("tari_wallet".to_string(), None);
+            
+            // Unregister the creation session
+            production_hardening::get_global_safety().unregister_resource(safety_resource_id);
+            
+            // Note: wallet_resource_id should be stored with the TariWallet for cleanup
+            // For now, we'll let the global safety system handle cleanup
             
             wallet_ptr
         },
