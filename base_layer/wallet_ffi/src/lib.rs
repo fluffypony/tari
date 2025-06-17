@@ -63,6 +63,10 @@ use std::{
 
 use chrono::{DateTime, Local};
 use error::LibWalletError;
+
+// Debug infrastructure for segfault investigation
+#[cfg(feature = "debug_runtime")]
+mod debug_segfault_investigation;
 use ffi_basenode_state::TariBaseNodeState;
 use itertools::Itertools;
 use libc::{c_char, c_int, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
@@ -6904,9 +6908,32 @@ pub unsafe extern "C" fn wallet_create(
         return ptr::null_mut();
     };
 
+    // Enhanced runtime creation with diagnostic logging
+    #[cfg(feature = "debug_runtime")]
+    {
+        debug_segfault_investigation::NodeJsDetector::log_environment_details();
+        
+        if debug_segfault_investigation::NodeJsDetector::is_nodejs_environment() {
+            warn!(target: "tari::wallet_ffi", "Creating Tokio runtime in Node.js environment - potential conflict risk");
+        }
+    }
+    
+    debug!(target: "tari::wallet_ffi", "Attempting to create Tokio runtime for wallet_create");
+    
     let runtime = match Runtime::new() {
-        Ok(r) => r,
+        Ok(r) => {
+            debug!(target: "tari::wallet_ffi", "Tokio runtime created successfully");
+            r
+        },
         Err(e) => {
+            error!(target: "tari::wallet_ffi", "Tokio runtime creation failed: {}", e);
+            #[cfg(feature = "debug_runtime")]
+            {
+                error!(target: "tari::wallet_ffi", "Runtime creation failure may be due to Node.js event loop conflicts");
+                if debug_segfault_investigation::NodeJsDetector::is_potential_nodejs_thread() {
+                    error!(target: "tari::wallet_ffi", "Failure occurred on potential Node.js thread");
+                }
+            }
             *error_out = LibWalletError::from(InterfaceError::TokioError(e.to_string())).code;
             return ptr::null_mut();
         },
@@ -6940,7 +6967,10 @@ pub unsafe extern "C" fn wallet_create(
     // implementation. It must not be the same as the peer database, hence the latter is changed here before use.
     comms_config.peer_database_name = comms_config.peer_database_name.to_owned() + "_peers";
 
+    debug!(target: "tari::wallet_ffi", "Starting runtime.block_on for master seed initialization");
+    
     let result = runtime.block_on(async {
+        debug!(target: "tari::wallet_ffi", "Inside async block - reading/creating master seed");
         let master_seed = read_or_create_master_seed(recovery_seed, &wallet_database)
             .map_err(|err| WalletStorageError::RecoverySeedError(err.to_string()))?;
         let comms_secret_key = derive_comms_secret_key(&master_seed)
@@ -7127,6 +7157,15 @@ pub unsafe extern "C" fn wallet_create(
     };
 
     let user_agent = format!("tari/wallet_ffi/{}", env!("CARGO_PKG_VERSION"));
+    
+    debug!(target: "tari::wallet_ffi", "Starting runtime.block_on for Wallet::start - this is the critical operation");
+    #[cfg(feature = "debug_runtime")]
+    {
+        if debug_segfault_investigation::NodeJsDetector::is_potential_nodejs_thread() {
+            warn!(target: "tari::wallet_ffi", "Wallet::start block_on being called on potential Node.js thread - high segfault risk");
+        }
+    }
+    
     let w = runtime.block_on(Wallet::start(
         wallet_config,
         peer_seeds,
@@ -7221,6 +7260,14 @@ pub unsafe extern "C" fn wallet_create(
                 callback_base_node_state,
             );
 
+            debug!(target: "tari::wallet_ffi", "Spawning callback handler on runtime - potential Node.js conflict point");
+            #[cfg(feature = "debug_runtime")]
+            {
+                if debug_segfault_investigation::NodeJsDetector::is_nodejs_environment() {
+                    warn!(target: "tari::wallet_ffi", "Spawning async callback handler in Node.js environment - monitor for crashes");
+                }
+            }
+            
             runtime.spawn(callback_handler.start());
 
             let tari_wallet = TariWallet {
