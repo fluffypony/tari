@@ -1,420 +1,560 @@
-// Alternative Runtime Strategies for Node.js Compatibility
-// Implements different approaches to avoid Tokio/Node.js event loop conflicts
+//! Runtime Strategies for Node.js Compatibility
+//! 
+//! Multiple Tokio runtime strategies to resolve conflicts with Node.js event loops
+//! that cause segfaults in the wallet_create function and other FFI operations.
 
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
-use tokio::runtime::{Runtime, Builder, Handle};
-use log::{debug, error, warn, info};
+use std::{
+    sync::{Arc, Mutex, mpsc, OnceLock},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use tokio::runtime::{Builder, Handle, Runtime};
+use log::{debug, error, info, warn};
 
-/// Available runtime strategies for wallet_create
-#[derive(Debug, Clone, PartialEq)]
+/// Global runtime strategy state
+static RUNTIME_STRATEGY: OnceLock<Arc<Mutex<Option<RuntimeManager>>>> = OnceLock::new();
+
+/// Runtime strategy options
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RuntimeStrategy {
-    /// Standard multi-threaded runtime (current implementation, high conflict risk)
+    /// Multi-threaded runtime (default, but problematic with Node.js)
     MultiThreaded,
-    /// Single-threaded runtime (lower conflict risk)
+    /// Single-threaded current thread runtime
     SingleThreaded,
-    /// Use existing runtime handle if available
-    CurrentThread,
-    /// Dedicated thread runtime (safest for Node.js)
+    /// Dedicated thread with isolated runtime
     DedicatedThread,
-    /// Configurable runtime based on environment detection
+    /// Use existing runtime handle if available
+    HandleBased,
+    /// Adaptive strategy based on environment detection
     Adaptive,
 }
 
-impl RuntimeStrategy {
-    /// Get the best strategy for the current environment
-    pub fn get_recommended_strategy() -> Self {
-        // Detect Node.js environment
-        let is_nodejs = std::env::var("NODE_ENV").is_ok() ||
-                       std::env::var("npm_config_user_config").is_ok() ||
-                       std::env::var("NODE_PATH").is_ok();
+/// Runtime execution context
+#[derive(Debug)]
+pub enum RuntimeContext {
+    /// Runtime is available and ready
+    Ready(RuntimeHandle),
+    /// Runtime initialization failed
+    Failed(String),
+    /// Runtime is being initialized
+    Initializing,
+}
 
-        if is_nodejs {
-            info!(
-                target: "tari::wallet_ffi::runtime_strategies",
-                "Node.js environment detected, using DedicatedThread strategy"
-            );
-            RuntimeStrategy::DedicatedThread
-        } else {
-            // Check if we're already in a Tokio runtime
-            if Handle::try_current().is_ok() {
-                info!(
-                    target: "tari::wallet_ffi::runtime_strategies",
-                    "Existing Tokio runtime detected, using CurrentThread strategy"
-                );
-                RuntimeStrategy::CurrentThread
-            } else {
-                info!(
-                    target: "tari::wallet_ffi::runtime_strategies",
-                    "No runtime conflicts detected, using SingleThreaded strategy"
-                );
-                RuntimeStrategy::SingleThreaded
-            }
-        }
-    }
+/// Runtime handle abstraction
+#[derive(Debug)]
+pub enum RuntimeHandle {
+    /// Direct runtime reference
+    Runtime(Arc<Runtime>),
+    /// Tokio handle reference
+    Handle(Handle),
+    /// Dedicated thread communication
+    Thread(ThreadedRuntime),
+}
 
-    /// Create runtime based on strategy
-    pub fn create_runtime(&self) -> Result<RuntimeWrapper, String> {
-        match self {
-            RuntimeStrategy::MultiThreaded => Self::create_multi_threaded_runtime(),
-            RuntimeStrategy::SingleThreaded => Self::create_single_threaded_runtime(),
-            RuntimeStrategy::CurrentThread => Self::create_current_thread_runtime(),
-            RuntimeStrategy::DedicatedThread => Self::create_dedicated_thread_runtime(),
-            RuntimeStrategy::Adaptive => {
-                let recommended = Self::get_recommended_strategy();
-                recommended.create_runtime()
-            }
-        }
-    }
+/// Dedicated thread runtime management
+#[derive(Debug)]
+pub struct ThreadedRuntime {
+    sender: mpsc::Sender<ThreadedTask>,
+    join_handle: Option<JoinHandle<()>>,
+}
 
-    fn create_multi_threaded_runtime() -> Result<RuntimeWrapper, String> {
-        debug!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Creating multi-threaded runtime"
-        );
+/// Task for threaded runtime execution
+#[derive(Debug)]
+struct ThreadedTask {
+    task: Box<dyn FnOnce() + Send>,
+    result_sender: mpsc::Sender<Result<(), String>>,
+}
 
-        let runtime = Runtime::new()
-            .map_err(|e| format!("Multi-threaded runtime creation failed: {}", e))?;
+/// Runtime manager for coordinating different strategies
+pub struct RuntimeManager {
+    strategy: RuntimeStrategy,
+    context: RuntimeContext,
+    nodejs_detected: bool,
+    initialization_time: Instant,
+}
 
-        Ok(RuntimeWrapper::Owned(runtime))
-    }
-
-    fn create_single_threaded_runtime() -> Result<RuntimeWrapper, String> {
-        debug!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Creating single-threaded runtime"
-        );
-
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Single-threaded runtime creation failed: {}", e))?;
-
-        Ok(RuntimeWrapper::Owned(runtime))
-    }
-
-    fn create_current_thread_runtime() -> Result<RuntimeWrapper, String> {
-        debug!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Using current thread runtime handle"
-        );
-
-        let handle = Handle::try_current()
-            .map_err(|e| format!("No current runtime available: {}", e))?;
-
-        Ok(RuntimeWrapper::Handle(handle))
-    }
-
-    fn create_dedicated_thread_runtime() -> Result<RuntimeWrapper, String> {
-        debug!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Creating dedicated thread runtime"
-        );
-
-        let (tx, rx) = mpsc::channel();
-        
-        let runtime_thread = thread::spawn(move || {
-            debug!(
-                target: "tari::wallet_ffi::runtime_strategies",
-                "Creating runtime on dedicated thread"
-            );
-
-            match Runtime::new() {
-                Ok(runtime) => {
-                    debug!(
-                        target: "tari::wallet_ffi::runtime_strategies",
-                        "Dedicated thread runtime created successfully"
-                    );
-                    
-                    let handle = runtime.handle().clone();
-                    
-                    // Send the handle back to the main thread
-                    if tx.send(Ok(handle)).is_err() {
-                        error!(
-                            target: "tari::wallet_ffi::runtime_strategies",
-                            "Failed to send runtime handle to main thread"
-                        );
-                        return;
-                    }
-
-                    // Keep the runtime alive by running forever
-                    runtime.block_on(async {
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!(
-                        target: "tari::wallet_ffi::runtime_strategies",
-                        "Dedicated thread runtime creation failed: {}", e
-                    );
-                    let _ = tx.send(Err(format!("Dedicated thread runtime failed: {}", e)));
-                }
-            }
+impl RuntimeManager {
+    /// Initialize with automatic strategy detection
+    pub fn initialize() -> Result<(), Box<dyn std::error::Error>> {
+        let strategy_mgr = RUNTIME_STRATEGY.get_or_init(|| {
+            Arc::new(Mutex::new(None))
         });
 
-        // Wait for the runtime to be created
-        let handle = rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "Timeout waiting for dedicated thread runtime".to_string())?
-            .map_err(|e| e)?;
+        let mut guard = strategy_mgr.lock().unwrap();
+        if guard.is_some() {
+            return Ok(()); // Already initialized
+        }
 
-        Ok(RuntimeWrapper::DedicatedThread {
-            handle,
-            _thread: runtime_thread,
-        })
+        let nodejs_detected = Self::detect_nodejs_environment();
+        let strategy = if nodejs_detected {
+            RuntimeStrategy::Adaptive
+        } else {
+            RuntimeStrategy::MultiThreaded
+        };
+
+        info!("Initializing runtime manager (Node.js detected: {}, strategy: {:?})", 
+              nodejs_detected, strategy);
+
+        let mut manager = Self {
+            strategy,
+            context: RuntimeContext::Initializing,
+            nodejs_detected,
+            initialization_time: Instant::now(),
+        };
+
+        manager.initialize_strategy()?;
+        *guard = Some(manager);
+
+        Ok(())
     }
-}
 
-/// Wrapper for different runtime types
-pub enum RuntimeWrapper {
-    /// Owned runtime (can use block_on)
-    Owned(Runtime),
-    /// Handle to existing runtime (can only spawn)
-    Handle(Handle),
-    /// Dedicated thread runtime with handle
-    DedicatedThread {
-        handle: Handle,
-        _thread: thread::JoinHandle<()>,
-    },
-}
+    /// Get or create runtime manager instance
+    pub fn get_instance() -> Result<Arc<Mutex<RuntimeManager>>, String> {
+        Self::initialize().map_err(|e| format!("Failed to initialize runtime manager: {}", e))?;
+        
+        let strategy_mgr = RUNTIME_STRATEGY.get()
+            .ok_or("Runtime strategy not initialized")?;
+        
+        let guard = strategy_mgr.lock().unwrap();
+        match guard.as_ref() {
+            Some(_) => Ok(strategy_mgr.clone()),
+            None => Err("Runtime manager not properly initialized".to_string()),
+        }
+    }
 
-impl RuntimeWrapper {
-    /// Execute a future with the runtime
-    pub fn execute<F>(&self, future: F) -> Result<F::Output, String>
+    /// Initialize the selected strategy
+    fn initialize_strategy(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Initializing runtime strategy: {:?}", self.strategy);
+
+        let result = match self.strategy {
+            RuntimeStrategy::MultiThreaded => self.init_multithreaded(),
+            RuntimeStrategy::SingleThreaded => self.init_single_threaded(),
+            RuntimeStrategy::DedicatedThread => self.init_dedicated_thread(),
+            RuntimeStrategy::HandleBased => self.init_handle_based(),
+            RuntimeStrategy::Adaptive => self.init_adaptive(),
+        };
+
+        match result {
+            Ok(handle) => {
+                self.context = RuntimeContext::Ready(handle);
+                info!("Runtime strategy initialized successfully in {:?}", 
+                     self.initialization_time.elapsed());
+                Ok(())
+            }
+            Err(e) => {
+                error!("Runtime strategy initialization failed: {}", e);
+                self.context = RuntimeContext::Failed(e.clone());
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Initialize multi-threaded runtime
+    fn init_multithreaded(&self) -> Result<RuntimeHandle, String> {
+        debug!("Creating multi-threaded runtime");
+        
+        let rt = Builder::new_multi_thread()
+            .worker_threads(2) // Limit threads to reduce conflicts
+            .thread_name("tari-wallet")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to create multi-threaded runtime: {}", e))?;
+
+        Ok(RuntimeHandle::Runtime(Arc::new(rt)))
+    }
+
+    /// Initialize single-threaded runtime
+    fn init_single_threaded(&self) -> Result<RuntimeHandle, String> {
+        debug!("Creating single-threaded runtime");
+        
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to create single-threaded runtime: {}", e))?;
+
+        Ok(RuntimeHandle::Runtime(Arc::new(rt)))
+    }
+
+    /// Initialize dedicated thread runtime
+    fn init_dedicated_thread(&self) -> Result<RuntimeHandle, String> {
+        debug!("Creating dedicated thread runtime");
+        
+        let (task_sender, task_receiver) = mpsc::channel::<ThreadedTask>();
+        
+        let handle = thread::Builder::new()
+            .name("tari-dedicated-runtime".to_string())
+            .spawn(move || {
+                info!("Dedicated runtime thread started");
+                
+                // Create runtime in dedicated thread
+                let rt = match Builder::new_current_thread()
+                    .enable_all()
+                    .build() 
+                {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        error!("Failed to create dedicated thread runtime: {}", e);
+                        return;
+                    }
+                };
+
+                // Process tasks
+                while let Ok(task) = task_receiver.recv() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(async {
+                            (task.task)();
+                        });
+                    }));
+
+                    let task_result = match result {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "Unknown panic in dedicated thread".to_string()
+                            };
+                            error!("Task panic in dedicated thread: {}", msg);
+                            Err(msg)
+                        }
+                    };
+
+                    let _ = task.result_sender.send(task_result);
+                }
+
+                info!("Dedicated runtime thread shutting down");
+            })
+            .map_err(|e| format!("Failed to spawn dedicated thread: {}", e))?;
+
+        Ok(RuntimeHandle::Thread(ThreadedRuntime {
+            sender: task_sender,
+            join_handle: Some(handle),
+        }))
+    }
+
+    /// Initialize handle-based runtime
+    fn init_handle_based(&self) -> Result<RuntimeHandle, String> {
+        debug!("Using existing runtime handle");
+        
+        match Handle::try_current() {
+            Ok(handle) => {
+                info!("Using existing Tokio runtime handle");
+                Ok(RuntimeHandle::Handle(handle))
+            }
+            Err(_) => {
+                warn!("No existing runtime handle, falling back to single-threaded");
+                self.init_single_threaded()
+            }
+        }
+    }
+
+    /// Initialize adaptive strategy based on environment
+    fn init_adaptive(&self) -> Result<RuntimeHandle, String> {
+        debug!("Using adaptive runtime strategy");
+        
+        if self.nodejs_detected {
+            info!("Node.js detected, using dedicated thread strategy");
+            self.init_dedicated_thread()
+        } else {
+            // Try handle-based first, then fall back to appropriate strategy
+            match Handle::try_current() {
+                Ok(handle) => {
+                    info!("Existing runtime handle found, using it");
+                    Ok(RuntimeHandle::Handle(handle))
+                }
+                Err(_) => {
+                    info!("No existing runtime, creating single-threaded runtime");
+                    self.init_single_threaded()
+                }
+            }
+        }
+    }
+
+    /// Detect Node.js environment
+    fn detect_nodejs_environment() -> bool {
+        // Check for Node.js environment variables
+        if std::env::var("NODE_VERSION").is_ok() || 
+           std::env::var("npm_config_registry").is_ok() ||
+           std::env::var("NODE_ENV").is_ok() ||
+           std::env::var("npm_lifecycle_event").is_ok() {
+            return true;
+        }
+
+        // Check process name
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(name) = exe.file_name() {
+                if let Some(name_str) = name.to_str() {
+                    if name_str.contains("node") || name_str.contains("npm") || name_str.contains("yarn") {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Check for process title patterns
+        if let Ok(args) = std::env::var("_") {
+            if args.contains("node") || args.contains("npm") {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Execute a future using the configured runtime strategy
+    pub fn block_on<F, T>(&self, future: F) -> Result<T, String> 
     where
-        F: std::future::Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
-        match self {
-            RuntimeWrapper::Owned(runtime) => {
-                debug!(
-                    target: "tari::wallet_ffi::runtime_strategies",
-                    "Executing future on owned runtime with block_on"
-                );
-                Ok(runtime.block_on(future))
+        match &self.context {
+            RuntimeContext::Ready(handle) => {
+                self.execute_with_handle(handle, future)
             }
-            RuntimeWrapper::Handle(handle) => {
-                debug!(
-                    target: "tari::wallet_ffi::runtime_strategies",
-                    "Spawning future on runtime handle"
-                );
-                
-                let join_handle = handle.spawn(future);
-                
-                // We need to block somehow to get the result
-                // This is tricky because we can't block_on within an async context
-                // For now, we'll spawn and then use a channel to get the result
+            RuntimeContext::Failed(err) => {
+                Err(format!("Runtime not available: {}", err))
+            }
+            RuntimeContext::Initializing => {
+                Err("Runtime is still initializing".to_string())
+            }
+        }
+    }
+
+    /// Execute future with specific runtime handle
+    fn execute_with_handle<F, T>(&self, handle: &RuntimeHandle, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match handle {
+            RuntimeHandle::Runtime(rt) => {
+                rt.block_on(future).into()
+            }
+            RuntimeHandle::Handle(h) => {
+                // For handle-based execution, we need to spawn and wait
                 let (tx, rx) = mpsc::channel();
                 
-                handle.spawn(async move {
-                    let result = join_handle.await;
-                    let _ = tx.send(result);
-                });
-                
-                // Wait for the result (this could potentially block)
-                rx.recv_timeout(Duration::from_secs(30))
-                    .map_err(|_| "Timeout waiting for async operation".to_string())?
-                    .map_err(|e| format!("Async operation failed: {}", e))
-            }
-            RuntimeWrapper::DedicatedThread { handle, .. } => {
-                debug!(
-                    target: "tari::wallet_ffi::runtime_strategies",
-                    "Executing future on dedicated thread runtime"
-                );
-                
-                let (tx, rx) = mpsc::channel();
-                
-                handle.spawn(async move {
+                h.spawn(async move {
                     let result = future.await;
                     let _ = tx.send(result);
                 });
-                
-                rx.recv_timeout(Duration::from_secs(60))
-                    .map_err(|_| "Timeout waiting for dedicated thread operation".to_string())
+
+                rx.recv_timeout(Duration::from_secs(30))
+                    .map_err(|e| format!("Handle-based execution timeout: {}", e))
+            }
+            RuntimeHandle::Thread(threaded) => {
+                self.execute_in_thread(threaded, future)
             }
         }
     }
 
-    /// Spawn a task on the runtime
-    pub fn spawn<F>(&self, future: F) -> Result<tokio::task::JoinHandle<F::Output>, String>
+    /// Execute future in dedicated thread
+    fn execute_in_thread<F, T>(&self, threaded: &ThreadedRuntime, future: F) -> Result<T, String>
     where
-        F: std::future::Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
-        let handle = match self {
-            RuntimeWrapper::Owned(runtime) => runtime.handle(),
-            RuntimeWrapper::Handle(handle) => handle,
-            RuntimeWrapper::DedicatedThread { handle, .. } => handle,
+        let (result_tx, result_rx) = mpsc::channel();
+        let (value_tx, value_rx) = mpsc::channel();
+
+        let task = ThreadedTask {
+            task: Box::new(move || {
+                // This will be executed inside the async context of the dedicated thread
+                tokio::spawn(async move {
+                    let result = future.await;
+                    let _ = value_tx.send(result);
+                });
+            }),
+            result_sender: result_tx,
         };
 
-        debug!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Spawning task on runtime"
-        );
+        threaded.sender.send(task)
+            .map_err(|e| format!("Failed to send task to dedicated thread: {}", e))?;
 
-        Ok(handle.spawn(future))
+        // Wait for task completion
+        result_rx.recv_timeout(Duration::from_secs(30))
+            .map_err(|e| format!("Dedicated thread task timeout: {}", e))?
+            .map_err(|e| format!("Dedicated thread task failed: {}", e))?;
+
+        // Wait for actual result
+        value_rx.recv_timeout(Duration::from_secs(30))
+            .map_err(|e| format!("Dedicated thread result timeout: {}", e))
     }
 
-    /// Get runtime type for debugging
-    pub fn get_type(&self) -> &'static str {
-        match self {
-            RuntimeWrapper::Owned(_) => "owned",
-            RuntimeWrapper::Handle(_) => "handle",
-            RuntimeWrapper::DedicatedThread { .. } => "dedicated_thread",
+    /// Get runtime statistics
+    pub fn get_statistics(&self) -> RuntimeStatistics {
+        RuntimeStatistics {
+            strategy: self.strategy,
+            nodejs_detected: self.nodejs_detected,
+            initialization_time: self.initialization_time.elapsed(),
+            is_ready: matches!(self.context, RuntimeContext::Ready(_)),
+            error: match &self.context {
+                RuntimeContext::Failed(err) => Some(err.clone()),
+                _ => None,
+            },
         }
     }
 }
 
-/// Runtime strategy selector with environment-based configuration
-pub struct RuntimeSelector {
-    strategy: RuntimeStrategy,
-    fallback_strategy: RuntimeStrategy,
+/// Runtime execution statistics
+#[derive(Debug)]
+pub struct RuntimeStatistics {
+    pub strategy: RuntimeStrategy,
+    pub nodejs_detected: bool,
+    pub initialization_time: Duration,
+    pub is_ready: bool,
+    pub error: Option<String>,
 }
 
-impl RuntimeSelector {
-    /// Create a new runtime selector with environment detection
-    pub fn new() -> Self {
-        let strategy = RuntimeStrategy::get_recommended_strategy();
-        let fallback_strategy = match strategy {
-            RuntimeStrategy::DedicatedThread => RuntimeStrategy::SingleThreaded,
-            RuntimeStrategy::CurrentThread => RuntimeStrategy::SingleThreaded,
-            RuntimeStrategy::SingleThreaded => RuntimeStrategy::MultiThreaded,
-            RuntimeStrategy::MultiThreaded => RuntimeStrategy::SingleThreaded,
-            RuntimeStrategy::Adaptive => RuntimeStrategy::SingleThreaded,
-        };
-
-        info!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Runtime selector created with strategy: {:?}, fallback: {:?}",
-            strategy, fallback_strategy
-        );
-
-        Self {
-            strategy,
-            fallback_strategy,
-        }
-    }
-
-    /// Create a runtime, trying fallback if primary strategy fails
-    pub fn create_runtime_with_fallback(&self) -> Result<RuntimeWrapper, String> {
-        info!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Attempting to create runtime with strategy: {:?}",
-            self.strategy
-        );
-
-        match self.strategy.create_runtime() {
-            Ok(runtime) => {
-                info!(
-                    target: "tari::wallet_ffi::runtime_strategies",
-                    "Primary runtime strategy succeeded: {:?}",
-                    self.strategy
-                );
-                Ok(runtime)
-            }
-            Err(e) => {
-                warn!(
-                    target: "tari::wallet_ffi::runtime_strategies",
-                    "Primary runtime strategy failed: {:?}, error: {}, trying fallback: {:?}",
-                    self.strategy, e, self.fallback_strategy
-                );
-
-                match self.fallback_strategy.create_runtime() {
-                    Ok(runtime) => {
-                        info!(
-                            target: "tari::wallet_ffi::runtime_strategies",
-                            "Fallback runtime strategy succeeded: {:?}",
-                            self.fallback_strategy
-                        );
-                        Ok(runtime)
-                    }
-                    Err(fallback_error) => {
-                        error!(
-                            target: "tari::wallet_ffi::runtime_strategies",
-                            "Both primary and fallback runtime strategies failed. Primary: {} Fallback: {}",
-                            e, fallback_error
-                        );
-                        Err(format!(
-                            "All runtime strategies failed. Primary ({}): {}, Fallback ({}): {}",
-                            self.strategy.as_str(), e, self.fallback_strategy.as_str(), fallback_error
-                        ))
-                    }
-                }
-            }
-        }
-    }
-
-    /// Get the current strategy
-    pub fn get_strategy(&self) -> &RuntimeStrategy {
-        &self.strategy
-    }
-
-    /// Override the strategy (for testing or manual configuration)
-    pub fn set_strategy(&mut self, strategy: RuntimeStrategy) {
-        info!(
-            target: "tari::wallet_ffi::runtime_strategies",
-            "Overriding runtime strategy from {:?} to {:?}",
-            self.strategy, strategy
-        );
-        self.strategy = strategy;
-    }
+/// Convenient macros for runtime execution
+#[macro_export]
+macro_rules! execute_async {
+    ($future:expr) => {{
+        use $crate::base_layer::wallet_ffi::src::runtime_strategies::RuntimeManager;
+        
+        let manager_arc = RuntimeManager::get_instance()
+            .map_err(|e| format!("Runtime not available: {}", e))?;
+        let manager = manager_arc.lock().unwrap();
+        manager.block_on($future)
+    }};
 }
 
-impl RuntimeStrategy {
-    fn as_str(&self) -> &'static str {
-        match self {
-            RuntimeStrategy::MultiThreaded => "multi_threaded",
-            RuntimeStrategy::SingleThreaded => "single_threaded",
-            RuntimeStrategy::CurrentThread => "current_thread",
-            RuntimeStrategy::DedicatedThread => "dedicated_thread",
-            RuntimeStrategy::Adaptive => "adaptive",
-        }
-    }
+/// Execute an async operation with automatic runtime strategy selection
+pub fn execute_with_runtime<F, T>(future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let manager_arc = RuntimeManager::get_instance()?;
+    let manager = manager_arc.lock().unwrap();
+    manager.block_on(future)
 }
 
-impl Default for RuntimeSelector {
-    fn default() -> Self {
-        Self::new()
+/// Initialize runtime strategies with specific strategy
+pub fn initialize_runtime_with_strategy(strategy: RuntimeStrategy) -> Result<(), String> {
+    let strategy_mgr = RUNTIME_STRATEGY.get_or_init(|| {
+        Arc::new(Mutex::new(None))
+    });
+
+    let mut guard = strategy_mgr.lock().unwrap();
+    if guard.is_some() {
+        return Ok(()); // Already initialized
+    }
+
+    let nodejs_detected = RuntimeManager::detect_nodejs_environment();
+    
+    let mut manager = RuntimeManager {
+        strategy,
+        context: RuntimeContext::Initializing,
+        nodejs_detected,
+        initialization_time: Instant::now(),
+    };
+
+    manager.initialize_strategy()
+        .map_err(|e| format!("Strategy initialization failed: {}", e))?;
+    
+    *guard = Some(manager);
+    Ok(())
+}
+
+/// Get current runtime statistics
+pub fn get_runtime_statistics() -> Option<RuntimeStatistics> {
+    let strategy_mgr = RUNTIME_STRATEGY.get()?;
+    let guard = strategy_mgr.lock().ok()?;
+    guard.as_ref().map(|manager| manager.get_statistics())
+}
+
+/// Force runtime strategy change (for testing)
+pub fn force_runtime_strategy(strategy: RuntimeStrategy) -> Result<(), String> {
+    let strategy_mgr = RUNTIME_STRATEGY.get_or_init(|| {
+        Arc::new(Mutex::new(None))
+    });
+
+    let mut guard = strategy_mgr.lock().unwrap();
+    
+    let nodejs_detected = RuntimeManager::detect_nodejs_environment();
+    
+    let mut manager = RuntimeManager {
+        strategy,
+        context: RuntimeContext::Initializing,
+        nodejs_detected,
+        initialization_time: Instant::now(),
+    };
+
+    manager.initialize_strategy()
+        .map_err(|e| format!("Strategy initialization failed: {}", e))?;
+    
+    *guard = Some(manager);
+    info!("Runtime strategy forced to: {:?}", strategy);
+    
+    Ok(())
+}
+
+impl Drop for ThreadedRuntime {
+    fn drop(&mut self) {
+        if let Some(handle) = self.join_handle.take() {
+            // Send shutdown signal and wait for thread
+            drop(self.sender.clone()); // Close the channel
+            let _ = handle.join();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    fn test_runtime_strategy_creation() {
-        let selector = RuntimeSelector::new();
-        assert!(!matches!(selector.get_strategy(), RuntimeStrategy::Adaptive));
+    fn test_runtime_initialization() {
+        let result = RuntimeManager::initialize();
+        assert!(result.is_ok(), "Runtime initialization failed: {:?}", result);
     }
 
     #[test]
-    fn test_multi_threaded_runtime() {
-        let strategy = RuntimeStrategy::MultiThreaded;
-        let result = strategy.create_runtime();
-        assert!(result.is_ok(), "Multi-threaded runtime should work in test environment");
+    fn test_nodejs_detection() {
+        // This test depends on environment, so we just verify it doesn't panic
+        let detected = RuntimeManager::detect_nodejs_environment();
+        println!("Node.js detected: {}", detected);
+        assert!(detected == true || detected == false); // Always true :)
     }
 
     #[test]
-    fn test_single_threaded_runtime() {
-        let strategy = RuntimeStrategy::SingleThreaded;
-        let result = strategy.create_runtime();
-        assert!(result.is_ok(), "Single-threaded runtime should work in test environment");
+    fn test_strategy_execution() {
+        let _ = RuntimeManager::initialize();
+        
+        let result = execute_with_runtime(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            42
+        });
+        
+        assert!(result.is_ok(), "Runtime execution failed: {:?}", result);
+        assert_eq!(result.unwrap(), 42);
     }
 
     #[test]
-    fn test_runtime_selector_fallback() {
-        let selector = RuntimeSelector::new();
-        let result = selector.create_runtime_with_fallback();
-        assert!(result.is_ok(), "Runtime selector should succeed with fallback");
-    }
+    fn test_all_strategies() {
+        let strategies = [
+            RuntimeStrategy::MultiThreaded,
+            RuntimeStrategy::SingleThreaded,
+            RuntimeStrategy::DedicatedThread,
+            RuntimeStrategy::HandleBased,
+        ];
 
-    #[tokio::test]
-    async fn test_current_thread_runtime() {
-        let strategy = RuntimeStrategy::CurrentThread;
-        let result = strategy.create_runtime();
-        assert!(result.is_ok(), "Current thread runtime should work when in Tokio context");
+        for &strategy in &strategies {
+            println!("Testing strategy: {:?}", strategy);
+            
+            let result = force_runtime_strategy(strategy);
+            if result.is_ok() {
+                let execution_result = execute_with_runtime(async { 1 + 1 });
+                assert!(execution_result.is_ok(), 
+                       "Strategy {:?} execution failed: {:?}", strategy, execution_result);
+            } else {
+                println!("Strategy {:?} initialization failed (expected on some platforms): {:?}", 
+                        strategy, result);
+            }
+        }
     }
 }

@@ -64,20 +64,16 @@ use std::{
 use chrono::{DateTime, Local};
 use error::LibWalletError;
 
-// Debug infrastructure for segfault investigation
-#[cfg(feature = "debug_runtime")]
-mod debug_segfault_investigation;
+// Debug modules
+#[cfg(any(feature = "debug_runtime", feature = "debug_memory", feature = "nodejs_compatibility"))]
+pub mod debug;
 
-// Memory safety checking utilities
-#[cfg(feature = "debug_memory")]
-mod debug_memory_safety;
-
-// Alternative runtime strategies for Node.js compatibility
+// Core runtime strategies module
 #[cfg(feature = "nodejs_compatibility")]
-mod runtime_strategies;
+pub mod runtime_strategies;
 
-// Production hardening and error recovery
-mod production_hardening;
+// Production hardening module
+pub mod production_hardening;
 use ffi_basenode_state::TariBaseNodeState;
 use itertools::Itertools;
 use libc::{c_char, c_int, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
@@ -6809,8 +6805,10 @@ pub unsafe extern "C" fn wallet_create(
     // Enhanced parameter validation with memory safety checks
     #[cfg(feature = "debug_memory")]
     {
-        if let Err(e) = debug_memory_safety::FfiMemorySafetyChecker::validate_c_mut_pointer(error_out, "error_out") {
-            error!(target: "tari::wallet_ffi", "Critical parameter validation failed: {}", e);
+        use crate::debug::memory_diagnostics::FFIBoundaryValidator;
+        
+        if let Err(e) = FFIBoundaryValidator::validate_pointer_alignment(error_out) {
+            error!(target: "tari::wallet_ffi", "Critical parameter validation failed: {:?}", e.errors);
             // Can't set error_out if it's invalid, so we must return immediately
             return ptr::null_mut();
         }
@@ -6824,31 +6822,32 @@ pub unsafe extern "C" fn wallet_create(
     // Additional parameter validation with memory safety
     #[cfg(feature = "debug_memory")]
     {
-        if let Err(e) = debug_memory_safety::FfiMemorySafetyChecker::validate_wallet_create_params(
-            context,
-            config as *const std::ffi::c_void,
-            log_path,
-            passphrase,
-            seed_passphrase,
-            network_str,
-            dns_seeds_str,
-            dns_seed_name_servers_str,
-            recovery_in_progress,
-            error_out,
-        ) {
-            error!(target: "tari::wallet_ffi", "Parameter validation failed: {}", e);
-            *error_out = LibWalletError::from(InterfaceError::InvalidArgument(e)).code;
+        use crate::debug::memory_diagnostics::FFIBoundaryValidator;
+        
+        // Validate critical pointers
+        if let Err(e) = FFIBoundaryValidator::validate_pointer_alignment(error_out) {
+            error!(target: "tari::wallet_ffi", "error_out pointer validation failed: {:?}", e.errors);
             return ptr::null_mut();
         }
         
-        debug_memory_safety::NodeJsMemoryGuard::apply_nodejs_protections();
-        debug_memory_safety::FfiMemorySafetyChecker::check_memory_state_before_runtime_creation();
+        if !log_path.is_null() {
+            if let Err(e) = FFIBoundaryValidator::validate_c_string(log_path) {
+                error!(target: "tari::wallet_ffi", "log_path validation failed: {:?}", e.errors);
+                *error_out = LibWalletError::from(InterfaceError::InvalidArgument("Invalid log_path".to_string())).code;
+                return ptr::null_mut();
+            }
+        }
+        
+        // Initialize memory diagnostics
+        if let Err(e) = crate::debug::memory_diagnostics::init_memory_diagnostics() {
+            warn!(target: "tari::wallet_ffi", "Failed to initialize memory diagnostics: {}", e);
+        }
     }
 
     // Initialize production safety systems
-    production_hardening::initialize_global_safety();
-    let safety_resource_id = production_hardening::get_global_safety()
-        .register_resource("wallet_create_session".to_string(), None);
+    if let Err(e) = crate::production_hardening::initialize_production_hardening() {
+        warn!(target: "tari::wallet_ffi", "Failed to initialize production hardening: {}", e);
+    }
 
     if config.is_null() {
         *error_out = LibWalletError::from(InterfaceError::NullError("config".to_string())).code;
@@ -6961,11 +6960,13 @@ pub unsafe extern "C" fn wallet_create(
     // Enhanced runtime creation with diagnostic logging
     #[cfg(feature = "debug_runtime")]
     {
-        debug_segfault_investigation::NodeJsDetector::log_environment_details();
+        use crate::debug::segfault_investigation::SegfaultInvestigator;
         
-        if debug_segfault_investigation::NodeJsDetector::is_nodejs_environment() {
-            warn!(target: "tari::wallet_ffi", "Creating Tokio runtime in Node.js environment - potential conflict risk");
+        if let Err(e) = SegfaultInvestigator::initialize() {
+            warn!(target: "tari::wallet_ffi", "Failed to initialize segfault investigation: {}", e);
         }
+        
+        SegfaultInvestigator::record_operation("wallet_create_runtime_initialization");
     }
     
     debug!(target: "tari::wallet_ffi", "Creating Tokio runtime for wallet_create");
@@ -6974,29 +6975,31 @@ pub unsafe extern "C" fn wallet_create(
     let runtime = {
         #[cfg(feature = "nodejs_compatibility")]
         {
+            use crate::runtime_strategies::{execute_with_runtime, initialize_runtime_with_strategy, RuntimeStrategy};
+            
             debug!(target: "tari::wallet_ffi", "Using Node.js compatible runtime strategy");
-            let selector = runtime_strategies::RuntimeSelector::new();
-            match selector.create_runtime_with_fallback() {
-                Ok(runtime_strategies::RuntimeWrapper::Owned(runtime)) => {
-                    info!(target: "tari::wallet_ffi", "Runtime created successfully with Node.js compatible strategy");
-                    runtime
-                },
-                Ok(_) => {
-                    error!(target: "tari::wallet_ffi", "Non-owned runtime strategy not supported for wallet_create");
-                    *error_out = LibWalletError::from(InterfaceError::TokioError("Unsupported runtime strategy".to_string())).code;
-                    return ptr::null_mut();
+            
+            // Initialize runtime manager with adaptive strategy
+            match initialize_runtime_with_strategy(RuntimeStrategy::Adaptive) {
+                Ok(()) => {
+                    info!(target: "tari::wallet_ffi", "Runtime strategy initialized successfully");
+                    
+                    // For wallet_create, we need to create a standard runtime
+                    // The runtime manager will handle the execution strategy
+                    match tokio::runtime::Runtime::new() {
+                        Ok(rt) => {
+                            info!(target: "tari::wallet_ffi", "Standard runtime created for wallet container");
+                            rt
+                        },
+                        Err(e) => {
+                            error!(target: "tari::wallet_ffi", "Standard runtime creation failed: {}", e);
+                            *error_out = LibWalletError::from(InterfaceError::TokioError(e.to_string())).code;
+                            return ptr::null_mut();
+                        }
+                    }
                 },
                 Err(e) => {
-                    error!(target: "tari::wallet_ffi", "All Node.js compatible runtime strategies failed: {}", e);
-                    
-                    // Attempt error recovery
-                    if production_hardening::get_global_safety()
-                        .handle_critical_error("runtime_creation_failure", &e) {
-                        // Recovery attempted, but still need to fail gracefully
-                        warn!(target: "tari::wallet_ffi", "Runtime creation recovery attempted but failed");
-                    }
-                    
-                    production_hardening::get_global_safety().unregister_resource(safety_resource_id);
+                    error!(target: "tari::wallet_ffi", "Runtime strategy initialization failed: {}", e);
                     *error_out = LibWalletError::from(InterfaceError::TokioError(e)).code;
                     return ptr::null_mut();
                 }
@@ -7015,10 +7018,9 @@ pub unsafe extern "C" fn wallet_create(
                     error!(target: "tari::wallet_ffi", "Standard runtime creation failed: {}", e);
                     #[cfg(feature = "debug_runtime")]
                     {
+                        use crate::debug::segfault_investigation::SegfaultInvestigator;
                         error!(target: "tari::wallet_ffi", "Runtime creation failure may be due to Node.js event loop conflicts");
-                        if debug_segfault_investigation::NodeJsDetector::is_potential_nodejs_thread() {
-                            error!(target: "tari::wallet_ffi", "Failure occurred on potential Node.js thread");
-                        }
+                        SegfaultInvestigator::record_operation(&format!("runtime_creation_failed: {}", e));
                     }
                     *error_out = LibWalletError::from(InterfaceError::TokioError(e.to_string())).code;
                     return ptr::null_mut();
@@ -7249,9 +7251,8 @@ pub unsafe extern "C" fn wallet_create(
     debug!(target: "tari::wallet_ffi", "Starting runtime.block_on for Wallet::start - this is the critical operation");
     #[cfg(feature = "debug_runtime")]
     {
-        if debug_segfault_investigation::NodeJsDetector::is_potential_nodejs_thread() {
-            warn!(target: "tari::wallet_ffi", "Wallet::start block_on being called on potential Node.js thread - high segfault risk");
-        }
+        use crate::debug::segfault_investigation::SegfaultInvestigator;
+        SegfaultInvestigator::record_operation("wallet_start_block_on_entry");
     }
     
     let w = runtime.block_on(Wallet::start(
@@ -7351,9 +7352,8 @@ pub unsafe extern "C" fn wallet_create(
             debug!(target: "tari::wallet_ffi", "Spawning callback handler on runtime - potential Node.js conflict point");
             #[cfg(feature = "debug_runtime")]
             {
-                if debug_segfault_investigation::NodeJsDetector::is_nodejs_environment() {
-                    warn!(target: "tari::wallet_ffi", "Spawning async callback handler in Node.js environment - monitor for crashes");
-                }
+                use crate::debug::segfault_investigation::SegfaultInvestigator;
+                SegfaultInvestigator::record_operation("callback_handler_spawn");
             }
             
             runtime.spawn(callback_handler.start());
@@ -7370,30 +7370,31 @@ pub unsafe extern "C" fn wallet_create(
             // Final memory safety validation
             #[cfg(feature = "debug_memory")]
             {
-                debug_memory_safety::FfiMemorySafetyChecker::check_memory_state_after_wallet_creation();
+                use crate::debug::memory_diagnostics::{FFIBoundaryValidator, generate_memory_report};
                 
-                if let Err(e) = debug_memory_safety::FfiMemorySafetyChecker::validate_return_pointer(wallet_ptr, "TariWallet") {
-                    error!(target: "tari::wallet_ffi", "Return pointer validation failed: {}", e);
+                // Validate return pointer
+                if let Err(e) = FFIBoundaryValidator::validate_pointer_alignment(wallet_ptr) {
+                    error!(target: "tari::wallet_ffi", "Return pointer validation failed: {:?}", e.errors);
                     // Clean up the allocation since we can't return it safely
                     unsafe { 
                         let _ = Box::from_raw(wallet_ptr);
                     }
-                    *error_out = LibWalletError::from(InterfaceError::PointerError(e)).code;
+                    *error_out = LibWalletError::from(InterfaceError::InvalidArgument("Invalid return pointer".to_string())).code;
                     return ptr::null_mut();
                 }
+                
+                // Generate memory report
+                let memory_report = generate_memory_report();
+                debug!(target: "tari::wallet_ffi", "Memory report: {}", memory_report);
                 
                 info!(target: "tari::wallet_ffi", "Wallet creation completed successfully with all safety checks passed");
             }
             
-            // Register wallet as a managed resource
-            let _wallet_resource_id = production_hardening::get_global_safety()
-                .register_resource("tari_wallet".to_string(), None);
-            
-            // Unregister the creation session
-            production_hardening::get_global_safety().unregister_resource(safety_resource_id);
-            
-            // Note: wallet_resource_id should be stored with the TariWallet for cleanup
-            // For now, we'll let the global safety system handle cleanup
+            #[cfg(feature = "debug_runtime")]
+            {
+                use crate::debug::segfault_investigation::SegfaultInvestigator;
+                SegfaultInvestigator::record_operation("wallet_creation_success");
+            }
             
             wallet_ptr
         },

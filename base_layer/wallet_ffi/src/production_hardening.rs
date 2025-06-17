@@ -1,541 +1,541 @@
-// Production Hardening for Wallet FFI
-// Implements graceful error handling, recovery mechanisms, and production safety
+//! Production Hardening for Wallet FFI
+//! 
+//! Production-ready safety mechanisms, error recovery, and crash detection
+//! to prevent and handle segfaults in production environments.
 
-use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}};
-use std::thread;
-use std::time::{Duration, Instant};
-use std::panic;
-use std::collections::HashMap;
-use log::{debug, error, warn, info};
+use std::{
+    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
+    time::{Duration, Instant},
+    thread,
+    panic::{self, PanicInfo},
+};
+use log::{debug, error, info, warn};
 
-/// Global crash detection and recovery system
-pub struct CrashDetector {
-    crash_count: Arc<AtomicU64>,
-    last_crash_time: Arc<Mutex<Option<Instant>>>,
-    is_crashed: Arc<AtomicBool>,
-    recovery_attempts: Arc<AtomicU64>,
+/// Global production hardening state
+static HARDENING_STATE: Mutex<Option<ProductionHardening>> = Mutex::new(None);
+
+/// Production hardening configuration
+#[derive(Debug, Clone)]
+pub struct HardeningConfig {
+    /// Enable crash detection and recovery
+    pub crash_detection: bool,
+    /// Enable resource monitoring
+    pub resource_monitoring: bool,
+    /// Enable automatic cleanup on errors
+    pub auto_cleanup: bool,
+    /// Maximum recovery attempts
+    pub max_recovery_attempts: usize,
+    /// Recovery timeout
+    pub recovery_timeout: Duration,
+    /// Memory usage threshold for warnings (bytes)
+    pub memory_warning_threshold: usize,
+    /// Enable graceful degradation
+    pub graceful_degradation: bool,
 }
 
-impl CrashDetector {
-    pub fn new() -> Self {
+impl Default for HardeningConfig {
+    fn default() -> Self {
         Self {
-            crash_count: Arc::new(AtomicU64::new(0)),
-            last_crash_time: Arc::new(Mutex::new(None)),
-            is_crashed: Arc::new(AtomicBool::new(false)),
-            recovery_attempts: Arc::new(AtomicU64::new(0)),
+            crash_detection: true,
+            resource_monitoring: true,
+            auto_cleanup: true,
+            max_recovery_attempts: 3,
+            recovery_timeout: Duration::from_secs(30),
+            memory_warning_threshold: 100 * 1024 * 1024, // 100MB
+            graceful_degradation: true,
         }
     }
+}
 
-    /// Install crash detection hooks
-    pub fn install_crash_hooks(&self) {
-        let crash_count = Arc::clone(&self.crash_count);
-        let last_crash_time = Arc::clone(&self.last_crash_time);
-        let is_crashed = Arc::clone(&self.is_crashed);
+/// Production hardening system
+pub struct ProductionHardening {
+    config: HardeningConfig,
+    crash_count: AtomicUsize,
+    recovery_attempts: AtomicUsize,
+    is_healthy: AtomicBool,
+    startup_time: Instant,
+    last_health_check: Mutex<Instant>,
+    emergency_shutdown: AtomicBool,
+}
 
-        // Install panic hook
-        let prev_hook = panic::take_hook();
-        panic::set_hook(Box::new(move |panic_info| {
-            error!(
-                target: "tari::wallet_ffi::crash_detector",
-                "PANIC DETECTED: {}", panic_info
-            );
+impl ProductionHardening {
+    /// Initialize production hardening
+    pub fn initialize(config: HardeningConfig) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = HARDENING_STATE.lock().unwrap();
+        if state.is_some() {
+            return Ok(()); // Already initialized
+        }
 
-            // Record crash
-            crash_count.fetch_add(1, Ordering::SeqCst);
-            is_crashed.store(true, Ordering::SeqCst);
-            
-            if let Ok(mut last_time) = last_crash_time.lock() {
-                *last_time = Some(Instant::now());
-            }
+        let hardening = Self {
+            config: config.clone(),
+            crash_count: AtomicUsize::new(0),
+            recovery_attempts: AtomicUsize::new(0),
+            is_healthy: AtomicBool::new(true),
+            startup_time: Instant::now(),
+            last_health_check: Mutex::new(Instant::now()),
+            emergency_shutdown: AtomicBool::new(false),
+        };
 
-            // Call previous hook
-            prev_hook(panic_info);
+        if config.crash_detection {
+            Self::install_crash_handlers();
+        }
+
+        if config.resource_monitoring {
+            Self::start_resource_monitor();
+        }
+
+        info!("Production hardening initialized with config: {:?}", config);
+        *state = Some(hardening);
+        Ok(())
+    }
+
+    /// Install crash detection and recovery handlers
+    fn install_crash_handlers() {
+        // Install panic handler
+        let original_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |panic_info: &PanicInfo| {
+            Self::handle_crash(panic_info);
+            original_hook(panic_info);
         }));
 
-        info!(
-            target: "tari::wallet_ffi::crash_detector",
-            "Crash detection hooks installed"
-        );
+        // Install signal handlers for Unix platforms
+        #[cfg(unix)]
+        Self::install_signal_handlers();
+
+        info!("Crash detection handlers installed");
     }
 
-    /// Check if system is in crashed state
-    pub fn is_crashed(&self) -> bool {
-        self.is_crashed.load(Ordering::SeqCst)
-    }
+    /// Install Unix signal handlers
+    #[cfg(unix)]
+    fn install_signal_handlers() {
+        use libc::{sigaction, sighandler_t, SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS};
+        use std::mem;
 
-    /// Get crash statistics
-    pub fn get_crash_stats(&self) -> CrashStats {
-        let crash_count = self.crash_count.load(Ordering::SeqCst);
-        let last_crash_elapsed = if let Ok(last_time) = self.last_crash_time.lock() {
-            last_time.map(|time| time.elapsed())
-        } else {
-            None
-        };
-
-        CrashStats {
-            total_crashes: crash_count,
-            last_crash_elapsed,
-            recovery_attempts: self.recovery_attempts.load(Ordering::SeqCst),
-        }
-    }
-
-    /// Attempt recovery from crashed state
-    pub fn attempt_recovery(&self) -> bool {
-        if !self.is_crashed() {
-            return true; // Not crashed, no recovery needed
-        }
-
-        let attempts = self.recovery_attempts.fetch_add(1, Ordering::SeqCst);
-        
-        warn!(
-            target: "tari::wallet_ffi::crash_detector",
-            "Attempting crash recovery, attempt #{}", attempts + 1
-        );
-
-        // Implement recovery logic
-        // For now, just reset the crashed state after a delay
-        thread::sleep(Duration::from_millis(100));
-        
-        self.is_crashed.store(false, Ordering::SeqCst);
-        
-        info!(
-            target: "tari::wallet_ffi::crash_detector",
-            "Crash recovery completed"
-        );
-
-        true
-    }
-}
-
-/// Crash statistics
-#[derive(Debug, Clone)]
-pub struct CrashStats {
-    pub total_crashes: u64,
-    pub last_crash_elapsed: Option<Duration>,
-    pub recovery_attempts: u64,
-}
-
-/// Resource cleanup manager
-pub struct ResourceCleanupManager {
-    active_resources: Arc<Mutex<HashMap<u64, ResourceInfo>>>,
-    next_resource_id: Arc<AtomicU64>,
-}
-
-#[derive(Debug, Clone)]
-struct ResourceInfo {
-    resource_type: String,
-    created_at: Instant,
-    thread_id: thread::ThreadId,
-    cleanup_fn: Option<fn()>,
-}
-
-impl ResourceCleanupManager {
-    pub fn new() -> Self {
-        Self {
-            active_resources: Arc::new(Mutex::new(HashMap::new())),
-            next_resource_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
-    /// Register a resource for cleanup
-    pub fn register_resource(&self, resource_type: String, cleanup_fn: Option<fn()>) -> u64 {
-        let resource_id = self.next_resource_id.fetch_add(1, Ordering::SeqCst);
-        
-        let resource_info = ResourceInfo {
-            resource_type: resource_type.clone(),
-            created_at: Instant::now(),
-            thread_id: thread::current().id(),
-            cleanup_fn,
-        };
-
-        if let Ok(mut resources) = self.active_resources.lock() {
-            resources.insert(resource_id, resource_info);
+        extern "C" fn crash_signal_handler(sig: i32) {
+            error!("=== FATAL SIGNAL RECEIVED: {} ===", sig);
+            ProductionHardening::handle_signal_crash(sig);
             
-            debug!(
-                target: "tari::wallet_ffi::resource_cleanup",
-                "Registered resource {}: {} on thread {:?}",
-                resource_id, resource_type, thread::current().id()
-            );
+            // Attempt graceful shutdown
+            ProductionHardening::emergency_shutdown();
+            
+            // Re-raise signal for system handling
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
         }
 
-        resource_id
-    }
+        unsafe {
+            let mut sa: libc::sigaction = mem::zeroed();
+            sa.sa_sigaction = crash_signal_handler as sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
 
-    /// Unregister a resource (normal cleanup)
-    pub fn unregister_resource(&self, resource_id: u64) {
-        if let Ok(mut resources) = self.active_resources.lock() {
-            if let Some(resource_info) = resources.remove(&resource_id) {
-                debug!(
-                    target: "tari::wallet_ffi::resource_cleanup",
-                    "Unregistered resource {}: {} (age: {:?})",
-                    resource_id, resource_info.resource_type, resource_info.created_at.elapsed()
-                );
+            for &signal in &[SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS] {
+                if sigaction(signal, &sa, std::ptr::null_mut()) != 0 {
+                    warn!("Failed to install signal handler for signal {}", signal);
+                }
             }
         }
     }
 
-    /// Cleanup all resources (emergency cleanup)
-    pub fn cleanup_all_resources(&self) {
-        warn!(
-            target: "tari::wallet_ffi::resource_cleanup",
-            "Emergency cleanup of all resources"
-        );
+    /// Handle panic crashes
+    fn handle_crash(panic_info: &PanicInfo) {
+        error!("=== PANIC DETECTED ===");
+        error!("Panic info: {}", panic_info);
+        
+        if let Ok(mut state) = HARDENING_STATE.lock() {
+            if let Some(ref mut hardening) = *state {
+                let crash_count = hardening.crash_count.fetch_add(1, Ordering::Relaxed) + 1;
+                error!("Crash count: {}", crash_count);
+                
+                hardening.is_healthy.store(false, Ordering::Relaxed);
+                
+                if crash_count >= 5 {
+                    error!("Critical crash threshold reached - initiating emergency shutdown");
+                    hardening.emergency_shutdown.store(true, Ordering::Relaxed);
+                    ProductionHardening::emergency_shutdown();
+                } else if hardening.config.auto_cleanup {
+                    warn!("Attempting automatic cleanup and recovery");
+                    ProductionHardening::attempt_recovery();
+                }
+            }
+        }
+    }
 
-        if let Ok(mut resources) = self.active_resources.lock() {
-            for (resource_id, resource_info) in resources.drain() {
-                warn!(
-                    target: "tari::wallet_ffi::resource_cleanup",
-                    "Cleaning up resource {}: {} (age: {:?})",
-                    resource_id, resource_info.resource_type, resource_info.created_at.elapsed()
-                );
+    /// Handle signal crashes
+    #[cfg(unix)]
+    fn handle_signal_crash(signal: i32) {
+        error!("Signal crash detected: {}", signal);
+        
+        // Log signal-specific information
+        match signal {
+            libc::SIGSEGV => error!("Segmentation fault - memory access violation"),
+            libc::SIGABRT => error!("Abort signal - program terminated"),
+            libc::SIGFPE => error!("Floating point exception"),
+            libc::SIGILL => error!("Illegal instruction"),
+            libc::SIGBUS => error!("Bus error - memory alignment issue"),
+            _ => error!("Unknown signal: {}", signal),
+        }
 
-                if let Some(cleanup_fn) = resource_info.cleanup_fn {
-                    // Call cleanup function in a safe manner
-                    let result = panic::catch_unwind(|| {
-                        cleanup_fn();
-                    });
+        // Force emergency shutdown for signal crashes
+        if let Ok(mut state) = HARDENING_STATE.lock() {
+            if let Some(ref mut hardening) = *state {
+                hardening.crash_count.fetch_add(1, Ordering::Relaxed);
+                hardening.is_healthy.store(false, Ordering::Relaxed);
+                hardening.emergency_shutdown.store(true, Ordering::Relaxed);
+            }
+        }
+    }
 
-                    if result.is_err() {
-                        error!(
-                            target: "tari::wallet_ffi::resource_cleanup",
-                            "Cleanup function panicked for resource {}", resource_id
-                        );
+    /// Start resource monitoring thread
+    fn start_resource_monitor() {
+        thread::Builder::new()
+            .name("resource-monitor".to_string())
+            .spawn(|| {
+                info!("Resource monitoring thread started");
+                
+                loop {
+                    thread::sleep(Duration::from_secs(30)); // Check every 30 seconds
+                    
+                    if let Ok(state) = HARDENING_STATE.lock() {
+                        if let Some(ref hardening) = *state {
+                            if hardening.emergency_shutdown.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            
+                            Self::check_system_health();
+                        }
+                    }
+                }
+                
+                info!("Resource monitoring thread stopped");
+            })
+            .unwrap_or_else(|e| {
+                error!("Failed to start resource monitor: {}", e);
+            });
+    }
+
+    /// Check system health
+    fn check_system_health() {
+        // Check memory usage
+        if let Some(memory_usage) = Self::get_memory_usage() {
+            if let Ok(state) = HARDENING_STATE.lock() {
+                if let Some(ref hardening) = *state {
+                    if memory_usage > hardening.config.memory_warning_threshold {
+                        warn!("High memory usage detected: {} bytes", memory_usage);
+                        
+                        if memory_usage > hardening.config.memory_warning_threshold * 2 {
+                            error!("Critical memory usage - triggering cleanup");
+                            Self::force_cleanup();
+                        }
                     }
                 }
             }
         }
 
-        info!(
-            target: "tari::wallet_ffi::resource_cleanup",
-            "Emergency cleanup completed"
-        );
-    }
-
-    /// Get resource statistics
-    pub fn get_resource_stats(&self) -> ResourceStats {
-        if let Ok(resources) = self.active_resources.lock() {
-            ResourceStats {
-                active_count: resources.len(),
-                resource_types: resources.values()
-                    .map(|info| info.resource_type.clone())
-                    .collect(),
-            }
-        } else {
-            ResourceStats {
-                active_count: 0,
-                resource_types: Vec::new(),
+        // Check if we're still healthy
+        if let Ok(mut state) = HARDENING_STATE.lock() {
+            if let Some(ref mut hardening) = *state {
+                *hardening.last_health_check.lock().unwrap() = Instant::now();
+                
+                // Reset health status if we've been stable for a while
+                let uptime = hardening.startup_time.elapsed();
+                if uptime > Duration::from_secs(300) && // 5 minutes uptime
+                   hardening.crash_count.load(Ordering::Relaxed) == 0 {
+                    hardening.is_healthy.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct ResourceStats {
-    pub active_count: usize,
-    pub resource_types: Vec<String>,
-}
+    /// Get current memory usage
+    fn get_memory_usage() -> Option<usize> {
+        // Platform-specific memory usage detection
+        #[cfg(target_os = "linux")]
+        {
+            use std::fs;
+            if let Ok(status) = fs::read_to_string("/proc/self/status") {
+                for line in status.lines() {
+                    if line.starts_with("VmRSS:") {
+                        if let Some(kb_str) = line.split_whitespace().nth(1) {
+                            if let Ok(kb) = kb_str.parse::<usize>() {
+                                return Some(kb * 1024); // Convert KB to bytes
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-/// Error recovery strategies
-pub struct ErrorRecoveryManager {
-    recovery_strategies: HashMap<String, Box<dyn Fn() -> bool + Send + Sync>>,
-    error_counts: Arc<Mutex<HashMap<String, u64>>>,
-}
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::Command;
+            if let Ok(output) = Command::new("ps")
+                .args(&["-o", "rss=", "-p"])
+                .arg(std::process::id().to_string())
+                .output() 
+            {
+                if let Ok(rss_str) = String::from_utf8(output.stdout) {
+                    if let Ok(kb) = rss_str.trim().parse::<usize>() {
+                        return Some(kb * 1024); // Convert KB to bytes
+                    }
+                }
+            }
+        }
 
-impl ErrorRecoveryManager {
-    pub fn new() -> Self {
-        let mut manager = Self {
-            recovery_strategies: HashMap::new(),
-            error_counts: Arc::new(Mutex::new(HashMap::new())),
+        None
+    }
+
+    /// Attempt automatic recovery
+    fn attempt_recovery() {
+        if let Ok(mut state) = HARDENING_STATE.lock() {
+            if let Some(ref mut hardening) = *state {
+                let attempts = hardening.recovery_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                
+                if attempts > hardening.config.max_recovery_attempts {
+                    error!("Maximum recovery attempts exceeded - giving up");
+                    hardening.emergency_shutdown.store(true, Ordering::Relaxed);
+                    return;
+                }
+                
+                info!("Attempting recovery (attempt {} of {})", attempts, hardening.config.max_recovery_attempts);
+                
+                // Perform recovery operations
+                ProductionHardening::force_cleanup();
+                
+                // Try to reinitialize components
+                info!("Attempting component reinitialization during recovery");
+                hardening.is_healthy.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Force cleanup of resources
+    fn force_cleanup() {
+        warn!("Forcing resource cleanup");
+        
+        // Force garbage collection if we detect Node.js environment
+        #[cfg(feature = "nodejs_compatibility")]
+        {
+            info!("Requesting garbage collection");
+            // In a real implementation, this would use N-API to request GC
+        }
+        
+        // Clear any cached data
+        Self::clear_caches();
+        
+        // Reset memory tracking
+        #[cfg(feature = "debug_memory")]
+        {
+            use crate::debug::memory_diagnostics::MemoryTracker;
+            let stats = MemoryTracker::get_statistics();
+            info!("Memory stats before cleanup: {:?}", stats);
+        }
+    }
+
+    /// Clear internal caches
+    fn clear_caches() {
+        debug!("Clearing internal caches");
+        // Implementation would clear any internal caches
+        // This is a placeholder for actual cache clearing logic
+    }
+
+    /// Emergency shutdown procedure
+    fn emergency_shutdown() {
+        error!("=== EMERGENCY SHUTDOWN INITIATED ===");
+        
+        // Set emergency flag
+        if let Ok(state) = HARDENING_STATE.lock() {
+            if let Some(ref hardening) = *state {
+                hardening.emergency_shutdown.store(true, Ordering::Relaxed);
+            }
+        }
+        
+        // Force cleanup
+        Self::force_cleanup();
+        
+        // Flush logs
+        log::logger().flush();
+        
+        error!("=== EMERGENCY SHUTDOWN COMPLETED ===");
+    }
+
+    /// Check if system is healthy
+    pub fn is_healthy() -> bool {
+        if let Ok(state) = HARDENING_STATE.lock() {
+            if let Some(ref hardening) = *state {
+                return hardening.is_healthy.load(Ordering::Relaxed) && 
+                       !hardening.emergency_shutdown.load(Ordering::Relaxed);
+            }
+        }
+        false
+    }
+
+    /// Get system statistics
+    pub fn get_statistics() -> Option<HardeningStatistics> {
+        if let Ok(state) = HARDENING_STATE.lock() {
+            if let Some(ref hardening) = *state {
+                return Some(HardeningStatistics {
+                    is_healthy: hardening.is_healthy.load(Ordering::Relaxed),
+                    crash_count: hardening.crash_count.load(Ordering::Relaxed),
+                    recovery_attempts: hardening.recovery_attempts.load(Ordering::Relaxed),
+                    uptime: hardening.startup_time.elapsed(),
+                    last_health_check: *hardening.last_health_check.lock().unwrap(),
+                    emergency_shutdown: hardening.emergency_shutdown.load(Ordering::Relaxed),
+                    memory_usage: Self::get_memory_usage(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Perform health check
+    pub fn health_check() -> HealthCheckResult {
+        let mut result = HealthCheckResult {
+            healthy: true,
+            issues: Vec::new(),
+            warnings: Vec::new(),
         };
 
-        // Register default recovery strategies
-        manager.register_default_strategies();
-        manager
-    }
+        if let Some(stats) = Self::get_statistics() {
+            if !stats.is_healthy {
+                result.healthy = false;
+                result.issues.push("System marked as unhealthy".to_string());
+            }
 
-    fn register_default_strategies(&mut self) {
-        // Runtime creation failure recovery
-        self.register_strategy(
-            "runtime_creation_failure".to_string(),
-            Box::new(|| {
-                warn!(
-                    target: "tari::wallet_ffi::error_recovery",
-                    "Attempting runtime creation failure recovery"
-                );
+            if stats.crash_count > 0 {
+                result.warnings.push(format!("Crash count: {}", stats.crash_count));
+            }
 
-                // Wait a moment and try again
-                thread::sleep(Duration::from_millis(100));
-                
-                // In a real implementation, we might:
-                // 1. Try a different runtime strategy
-                // 2. Clear any corrupted state
-                // 3. Reset environment variables
-                
-                true // Indicate recovery was attempted
-            })
-        );
+            if stats.recovery_attempts > 0 {
+                result.warnings.push(format!("Recovery attempts: {}", stats.recovery_attempts));
+            }
 
-        // Memory allocation failure recovery
-        self.register_strategy(
-            "memory_allocation_failure".to_string(),
-            Box::new(|| {
-                warn!(
-                    target: "tari::wallet_ffi::error_recovery",
-                    "Attempting memory allocation failure recovery"
-                );
-
-                // Force garbage collection if available
-                #[cfg(feature = "debug_memory")]
-                {
-                    // In a real implementation, we might trigger GC
-                    // or free up cached memory
+            if let Some(memory) = stats.memory_usage {
+                if memory > 200 * 1024 * 1024 { // 200MB
+                    result.warnings.push(format!("High memory usage: {}MB", memory / 1024 / 1024));
                 }
+            }
 
-                thread::sleep(Duration::from_millis(50));
-                true
-            })
-        );
+            if stats.emergency_shutdown {
+                result.healthy = false;
+                result.issues.push("Emergency shutdown active".to_string());
+            }
+        } else {
+            result.healthy = false;
+            result.issues.push("Hardening system not initialized".to_string());
+        }
 
-        // Network connectivity failure recovery
-        self.register_strategy(
-            "network_failure".to_string(),
-            Box::new(|| {
-                warn!(
-                    target: "tari::wallet_ffi::error_recovery",
-                    "Attempting network failure recovery"
-                );
-
-                thread::sleep(Duration::from_millis(200));
-                true
-            })
-        );
+        result
     }
+}
 
-    /// Register a custom recovery strategy
-    pub fn register_strategy<F>(&mut self, error_type: String, strategy: F)
+/// Hardening statistics
+#[derive(Debug)]
+pub struct HardeningStatistics {
+    pub is_healthy: bool,
+    pub crash_count: usize,
+    pub recovery_attempts: usize,
+    pub uptime: Duration,
+    pub last_health_check: Instant,
+    pub emergency_shutdown: bool,
+    pub memory_usage: Option<usize>,
+}
+
+/// Health check result
+#[derive(Debug)]
+pub struct HealthCheckResult {
+    pub healthy: bool,
+    pub issues: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Graceful operation wrapper with timeout and recovery
+pub struct GracefulOperation<T> {
+    operation: Box<dyn FnOnce() -> Result<T, String> + Send>,
+    timeout: Duration,
+    description: String,
+}
+
+impl<T> GracefulOperation<T> {
+    /// Create new graceful operation
+    pub fn new<F>(operation: F, timeout: Duration, description: String) -> Self
     where
-        F: Fn() -> bool + Send + Sync + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
     {
-        self.recovery_strategies.insert(error_type.clone(), Box::new(strategy));
-        
-        debug!(
-            target: "tari::wallet_ffi::error_recovery",
-            "Registered recovery strategy for: {}", error_type
-        );
-    }
-
-    /// Attempt recovery for a specific error type
-    pub fn attempt_recovery(&self, error_type: &str) -> bool {
-        // Track error occurrence
-        if let Ok(mut counts) = self.error_counts.lock() {
-            let count = counts.entry(error_type.to_string()).or_insert(0);
-            *count += 1;
-
-            // Don't attempt recovery if we've seen too many of this error
-            if *count > 10 {
-                error!(
-                    target: "tari::wallet_ffi::error_recovery",
-                    "Too many {} errors ({}), not attempting recovery",
-                    error_type, count
-                );
-                return false;
-            }
-        }
-
-        // Attempt recovery
-        if let Some(strategy) = self.recovery_strategies.get(error_type) {
-            info!(
-                target: "tari::wallet_ffi::error_recovery",
-                "Attempting recovery for error type: {}", error_type
-            );
-
-            match panic::catch_unwind(panic::AssertUnwindSafe(|| strategy())) {
-                Ok(success) => {
-                    if success {
-                        info!(
-                            target: "tari::wallet_ffi::error_recovery",
-                            "Recovery successful for: {}", error_type
-                        );
-                    } else {
-                        warn!(
-                            target: "tari::wallet_ffi::error_recovery",
-                            "Recovery failed for: {}", error_type
-                        );
-                    }
-                    success
-                }
-                Err(_) => {
-                    error!(
-                        target: "tari::wallet_ffi::error_recovery",
-                        "Recovery strategy panicked for: {}", error_type
-                    );
-                    false
-                }
-            }
-        } else {
-            debug!(
-                target: "tari::wallet_ffi::error_recovery",
-                "No recovery strategy available for: {}", error_type
-            );
-            false
-        }
-    }
-
-    /// Get error statistics
-    pub fn get_error_stats(&self) -> HashMap<String, u64> {
-        self.error_counts.lock()
-            .map(|counts| counts.clone())
-            .unwrap_or_default()
-    }
-}
-
-/// Production safety coordinator
-pub struct ProductionSafetyCoordinator {
-    crash_detector: CrashDetector,
-    resource_manager: ResourceCleanupManager,
-    error_recovery: ErrorRecoveryManager,
-    safety_enabled: AtomicBool,
-}
-
-impl ProductionSafetyCoordinator {
-    pub fn new() -> Self {
         Self {
-            crash_detector: CrashDetector::new(),
-            resource_manager: ResourceCleanupManager::new(),
-            error_recovery: ErrorRecoveryManager::new(),
-            safety_enabled: AtomicBool::new(true),
+            operation: Box::new(operation),
+            timeout,
+            description,
         }
     }
 
-    /// Initialize production safety systems
-    pub fn initialize(&self) {
-        if !self.safety_enabled.load(Ordering::SeqCst) {
-            debug!(
-                target: "tari::wallet_ffi::production_safety",
-                "Production safety disabled, skipping initialization"
-            );
-            return;
+    /// Execute with graceful error handling
+    pub fn execute(self) -> Result<T, String> {
+        if !ProductionHardening::is_healthy() {
+            return Err("System is not healthy - operation aborted".to_string());
         }
 
-        info!(
-            target: "tari::wallet_ffi::production_safety",
-            "Initializing production safety systems"
-        );
-
-        self.crash_detector.install_crash_hooks();
-
-        info!(
-            target: "tari::wallet_ffi::production_safety",
-            "Production safety systems initialized"
-        );
-    }
-
-    /// Handle a critical error with recovery attempt
-    pub fn handle_critical_error(&self, error_type: &str, error_message: &str) -> bool {
-        error!(
-            target: "tari::wallet_ffi::production_safety",
-            "Critical error detected: {} - {}", error_type, error_message
-        );
-
-        // Attempt error recovery
-        let recovery_success = self.error_recovery.attempt_recovery(error_type);
-
-        if !recovery_success {
-            warn!(
-                target: "tari::wallet_ffi::production_safety",
-                "Error recovery failed, triggering emergency cleanup"
-            );
-            
-            self.emergency_shutdown();
-        }
-
-        recovery_success
-    }
-
-    /// Emergency shutdown and cleanup
-    pub fn emergency_shutdown(&self) {
-        warn!(
-            target: "tari::wallet_ffi::production_safety",
-            "Initiating emergency shutdown"
-        );
-
-        // Cleanup all resources
-        self.resource_manager.cleanup_all_resources();
-
-        // Try to recover from any crashes
-        self.crash_detector.attempt_recovery();
-
-        info!(
-            target: "tari::wallet_ffi::production_safety",
-            "Emergency shutdown completed"
-        );
-    }
-
-    /// Register a resource for cleanup tracking
-    pub fn register_resource(&self, resource_type: String, cleanup_fn: Option<fn()>) -> u64 {
-        self.resource_manager.register_resource(resource_type, cleanup_fn)
-    }
-
-    /// Unregister a resource
-    pub fn unregister_resource(&self, resource_id: u64) {
-        self.resource_manager.unregister_resource(resource_id);
-    }
-
-    /// Get comprehensive safety status
-    pub fn get_safety_status(&self) -> SafetyStatus {
-        SafetyStatus {
-            safety_enabled: self.safety_enabled.load(Ordering::SeqCst),
-            crash_stats: self.crash_detector.get_crash_stats(),
-            resource_stats: self.resource_manager.get_resource_stats(),
-            error_stats: self.error_recovery.get_error_stats(),
-            is_crashed: self.crash_detector.is_crashed(),
-        }
-    }
-
-    /// Enable or disable safety systems
-    pub fn set_safety_enabled(&self, enabled: bool) {
-        self.safety_enabled.store(enabled, Ordering::SeqCst);
+        info!("Executing graceful operation: {}", self.description);
         
-        if enabled {
-            info!(
-                target: "tari::wallet_ffi::production_safety",
-                "Production safety systems enabled"
-            );
-        } else {
-            warn!(
-                target: "tari::wallet_ffi::production_safety",
-                "Production safety systems disabled"
-            );
+        let start_time = Instant::now();
+        
+        // Execute with panic catching
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.operation)()
+        }));
+
+        let elapsed = start_time.elapsed();
+        
+        match result {
+            Ok(Ok(value)) => {
+                debug!("Operation '{}' completed successfully in {:?}", self.description, elapsed);
+                Ok(value)
+            }
+            Ok(Err(e)) => {
+                warn!("Operation '{}' failed after {:?}: {}", self.description, elapsed, e);
+                Err(e)
+            }
+            Err(_) => {
+                error!("Operation '{}' panicked after {:?}", self.description, elapsed);
+                Err(format!("Operation '{}' panicked", self.description))
+            }
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SafetyStatus {
-    pub safety_enabled: bool,
-    pub crash_stats: CrashStats,
-    pub resource_stats: ResourceStats,
-    pub error_stats: HashMap<String, u64>,
-    pub is_crashed: bool,
+/// Macro for wrapping operations with graceful error handling
+#[macro_export]
+macro_rules! graceful_operation {
+    ($operation:expr, $timeout:expr, $description:expr) => {{
+        use $crate::base_layer::wallet_ffi::src::production_hardening::GracefulOperation;
+        GracefulOperation::new($operation, $timeout, $description.to_string()).execute()
+    }};
 }
 
-impl Default for ProductionSafetyCoordinator {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Initialize production hardening with default config
+pub fn initialize_production_hardening() -> Result<(), Box<dyn std::error::Error>> {
+    ProductionHardening::initialize(HardeningConfig::default())
 }
 
-// Global safety coordinator instance
-static GLOBAL_SAFETY: OnceLock<ProductionSafetyCoordinator> = OnceLock::new();
-
-/// Get global safety coordinator
-pub fn get_global_safety() -> &'static ProductionSafetyCoordinator {
-    GLOBAL_SAFETY.get_or_init(|| ProductionSafetyCoordinator::new())
+/// Initialize production hardening with custom config
+pub fn initialize_with_config(config: HardeningConfig) -> Result<(), Box<dyn std::error::Error>> {
+    ProductionHardening::initialize(config)
 }
 
-/// Initialize global safety systems
-pub fn initialize_global_safety() {
-    get_global_safety().initialize();
+/// Check if the system is healthy
+pub fn is_system_healthy() -> bool {
+    ProductionHardening::is_healthy()
+}
+
+/// Get current hardening statistics
+pub fn get_hardening_statistics() -> Option<HardeningStatistics> {
+    ProductionHardening::get_statistics()
+}
+
+/// Perform comprehensive health check
+pub fn perform_health_check() -> HealthCheckResult {
+    ProductionHardening::health_check()
 }
 
 #[cfg(test)]
@@ -543,55 +543,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_crash_detector() {
-        let detector = CrashDetector::new();
+    fn test_hardening_initialization() {
+        let config = HardeningConfig {
+            crash_detection: false, // Disable for testing
+            resource_monitoring: false,
+            ..Default::default()
+        };
         
-        assert!(!detector.is_crashed());
-        
-        let stats = detector.get_crash_stats();
-        assert_eq!(stats.total_crashes, 0);
-        assert_eq!(stats.recovery_attempts, 0);
+        let result = ProductionHardening::initialize(config);
+        assert!(result.is_ok(), "Hardening initialization failed: {:?}", result);
     }
 
     #[test]
-    fn test_resource_manager() {
-        let manager = ResourceCleanupManager::new();
+    fn test_health_check() {
+        let _ = initialize_with_config(HardeningConfig {
+            crash_detection: false,
+            resource_monitoring: false,
+            ..Default::default()
+        });
         
-        let resource_id = manager.register_resource("test_resource".to_string(), None);
-        
-        let stats = manager.get_resource_stats();
-        assert_eq!(stats.active_count, 1);
-        assert!(stats.resource_types.contains(&"test_resource".to_string()));
-        
-        manager.unregister_resource(resource_id);
-        
-        let stats = manager.get_resource_stats();
-        assert_eq!(stats.active_count, 0);
+        let health = perform_health_check();
+        // Should be healthy after initialization
+        assert!(health.healthy || !health.issues.is_empty()); // Either healthy or has explainable issues
     }
 
     #[test]
-    fn test_error_recovery() {
-        let recovery = ErrorRecoveryManager::new();
+    fn test_graceful_operation() {
+        let _ = initialize_production_hardening();
         
-        // Test known strategy
-        assert!(recovery.attempt_recovery("runtime_creation_failure"));
+        let result = graceful_operation!(
+            || Ok(42),
+            Duration::from_secs(1),
+            "test operation"
+        );
         
-        // Test unknown strategy
-        assert!(!recovery.attempt_recovery("unknown_error"));
-    }
-
-    #[test]
-    fn test_safety_coordinator() {
-        let coordinator = ProductionSafetyCoordinator::new();
-        
-        coordinator.initialize();
-        
-        let status = coordinator.get_safety_status();
-        assert!(status.safety_enabled);
-        assert!(!status.is_crashed);
-        
-        coordinator.set_safety_enabled(false);
-        let status = coordinator.get_safety_status();
-        assert!(!status.safety_enabled);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
     }
 }

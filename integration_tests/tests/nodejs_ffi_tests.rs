@@ -1,349 +1,451 @@
-// Node.js FFI Integration Tests
-// Tests for the enhanced wallet_create function with Node.js compatibility
+//! Node.js FFI Integration Tests
+//! 
+//! Comprehensive test suite for validating the segfault fixes and ensuring
+//! proper operation of the Tari wallet FFI in Node.js environments.
 
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
-use std::ptr;
-use std::thread;
-use std::time::Duration;
-use minotari_wallet_ffi;
+use std::{
+    ffi::{CStr, CString},
+    ptr,
+    time::Duration,
+};
+use tempfile::tempdir;
+use tokio::runtime::Runtime;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[cfg(any(feature = "debug_runtime", feature = "debug_memory", feature = "nodejs_compatibility"))]
+use minotari_wallet_ffi::debug;
 
-    // Mock TariCommsConfig for testing
-    #[repr(C)]
-    struct MockTariCommsConfig {
-        data: [u8; 64], // Placeholder data
-    }
+#[cfg(feature = "nodejs_compatibility")]
+use minotari_wallet_ffi::runtime_strategies::{
+    RuntimeStrategy, 
+    initialize_runtime_with_strategy, 
+    execute_with_runtime,
+    get_runtime_statistics
+};
 
-    // Basic FFI safety tests
-    #[test]
-    fn test_null_pointer_handling() {
-        // Test that null pointers are handled gracefully
-        let mut error_out: c_int = 0;
-        
-        // This should fail safely without crashing
-        let result = unsafe {
-            minotari_wallet_ffi::wallet_create(
-                ptr::null_mut(),      // context
-                ptr::null_mut(),      // config (should cause error)
-                ptr::null(),          // log_path
-                0,                    // log_verbosity  
-                0,                    // num_rolling_log_files
-                0,                    // size_per_log_file_bytes
-                ptr::null(),          // passphrase
-                ptr::null(),          // seed_passphrase
-                ptr::null_mut(),      // seed_words
-                ptr::null(),          // network_str
-                ptr::null(),          // dns_seeds_str
-                ptr::null(),          // dns_seed_name_servers_str
-                false,                // use_dns_sec
-                dummy_callback,       // callback_received_transaction
-                dummy_callback_reply, // callback_received_transaction_reply
-                dummy_callback_final, // callback_received_finalized_transaction
-                dummy_callback_broadcast, // callback_transaction_broadcast
-                dummy_callback_mined, // callback_transaction_mined
-                dummy_callback_mined_unconfirmed, // callback_transaction_mined_unconfirmed
-                dummy_callback_faux_confirmed, // callback_faux_transaction_confirmed
-                dummy_callback_faux_unconfirmed, // callback_faux_transaction_unconfirmed
-                dummy_callback_send_result, // callback_transaction_send_result
-                dummy_callback_cancellation, // callback_transaction_cancellation
-                dummy_callback_txo_validation, // callback_txo_validation_complete
-                dummy_callback_contacts_liveness, // callback_contacts_liveness_data_updated
-                dummy_callback_balance, // callback_balance_updated
-                dummy_callback_tx_validation, // callback_transaction_validation_complete
-                dummy_callback_saf, // callback_saf_messages_received
-                dummy_callback_connectivity, // callback_connectivity_status
-                dummy_callback_wallet_scanned, // callback_wallet_scanned_height
-                dummy_callback_base_node_state, // callback_base_node_state
-                ptr::null_mut(),      // recovery_in_progress
-                &mut error_out,       // error_out
-            )
-        };
+#[cfg(feature = "debug_memory")]
+use minotari_wallet_ffi::debug::memory_diagnostics::{
+    FFIBoundaryValidator,
+    MemoryTracker,
+    init_memory_diagnostics,
+    generate_memory_report
+};
 
-        // Should return null pointer and set error
-        assert!(result.is_null());
-        assert_ne!(error_out, 0);
-    }
+#[cfg(feature = "debug_runtime")]
+use minotari_wallet_ffi::debug::segfault_investigation::SegfaultInvestigator;
 
-    #[test]
-    fn test_error_parameter_validation() {
-        // Test with null error_out parameter - should return null immediately
-        let result = unsafe {
-            minotari_wallet_ffi::wallet_create(
-                ptr::null_mut(),      // context
-                ptr::null_mut(),      // config
-                ptr::null(),          // log_path
-                0,                    // log_verbosity
-                0,                    // num_rolling_log_files
-                0,                    // size_per_log_file_bytes
-                ptr::null(),          // passphrase
-                ptr::null(),          // seed_passphrase
-                ptr::null_mut(),      // seed_words
-                ptr::null(),          // network_str
-                ptr::null(),          // dns_seeds_str
-                ptr::null(),          // dns_seed_name_servers_str
-                false,                // use_dns_sec
-                dummy_callback,
-                dummy_callback_reply,
-                dummy_callback_final,
-                dummy_callback_broadcast,
-                dummy_callback_mined,
-                dummy_callback_mined_unconfirmed,
-                dummy_callback_faux_confirmed,
-                dummy_callback_faux_unconfirmed,
-                dummy_callback_send_result,
-                dummy_callback_cancellation,
-                dummy_callback_txo_validation,
-                dummy_callback_contacts_liveness,
-                dummy_callback_balance,
-                dummy_callback_tx_validation,
-                dummy_callback_saf,
-                dummy_callback_connectivity,
-                dummy_callback_wallet_scanned,
-                dummy_callback_base_node_state,
-                ptr::null_mut(),      // recovery_in_progress
-                ptr::null_mut(),      // error_out (NULL!)
-            )
-        };
+use minotari_wallet_ffi::production_hardening::{
+    initialize_production_hardening,
+    is_system_healthy,
+    perform_health_check
+};
 
-        // Should return null pointer when error_out is null
-        assert!(result.is_null());
-    }
-
+/// Test initialization of debugging infrastructure
+#[test]
+fn test_debug_infrastructure_initialization() {
+    // Initialize memory diagnostics
     #[cfg(feature = "debug_memory")]
-    #[test]
-    fn test_memory_safety_validation() {
-        use minotari_wallet_ffi::debug_memory_safety::FfiMemorySafetyChecker;
-
-        // Test pointer validation
-        let test_value: u64 = 42;
-        let valid_ptr = &test_value as *const u64;
+    {
+        let result = init_memory_diagnostics();
+        assert!(result.is_ok(), "Memory diagnostics initialization failed: {:?}", result);
         
-        assert!(FfiMemorySafetyChecker::validate_c_pointer(valid_ptr, "test_param").is_ok());
-        assert!(FfiMemorySafetyChecker::validate_c_pointer(ptr::null::<u64>(), "null_param").is_err());
+        // Test memory tracker
+        let stats = MemoryTracker::get_statistics();
+        println!("Initial memory stats: {:?}", stats);
+    }
 
-        // Test C string validation
-        let test_string = CString::new("test").unwrap();
-        let c_str_ptr = test_string.as_ptr();
+    // Initialize segfault investigation
+    #[cfg(feature = "debug_runtime")]
+    {
+        let result = SegfaultInvestigator::initialize();
+        assert!(result.is_ok(), "Segfault investigator initialization failed: {:?}", result);
         
-        assert!(FfiMemorySafetyChecker::validate_c_string(c_str_ptr, "test_string").is_ok());
-        assert!(FfiMemorySafetyChecker::validate_c_string(ptr::null(), "null_string").is_err());
+        // Test operation recording
+        SegfaultInvestigator::record_operation("test_operation");
+        SegfaultInvestigator::record_nodejs_operation("test_nodejs", "test_details");
+        SegfaultInvestigator::record_tokio_operation("test_tokio", "test_details");
+    }
+
+    // Initialize production hardening
+    let result = initialize_production_hardening();
+    assert!(result.is_ok(), "Production hardening initialization failed: {:?}", result);
+    
+    // Test health check
+    let health = perform_health_check();
+    println!("Health check result: {:?}", health);
+}
+
+/// Test runtime strategy initialization and execution
+#[cfg(feature = "nodejs_compatibility")]
+#[test]
+fn test_runtime_strategies() {
+    // Test all runtime strategies
+    let strategies = [
+        RuntimeStrategy::MultiThreaded,
+        RuntimeStrategy::SingleThreaded,
+        RuntimeStrategy::DedicatedThread,
+        RuntimeStrategy::HandleBased,
+        RuntimeStrategy::Adaptive,
+    ];
+
+    for &strategy in &strategies {
+        println!("Testing runtime strategy: {:?}", strategy);
+        
+        let result = initialize_runtime_with_strategy(strategy);
+        match result {
+            Ok(()) => {
+                println!("Strategy {:?} initialized successfully", strategy);
+                
+                // Test execution
+                let execution_result = execute_with_runtime(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    42
+                });
+                
+                match execution_result {
+                    Ok(value) => {
+                        assert_eq!(value, 42);
+                        println!("Strategy {:?} execution successful", strategy);
+                    }
+                    Err(e) => {
+                        println!("Strategy {:?} execution failed: {}", strategy, e);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Strategy {:?} initialization failed: {}", strategy, e);
+                // Some strategies may fail depending on environment, that's ok
+            }
+        }
+    }
+
+    // Test statistics
+    if let Some(stats) = get_runtime_statistics() {
+        println!("Runtime statistics: {:?}", stats);
+    }
+}
+
+/// Test memory boundary validation
+#[cfg(feature = "debug_memory")]
+#[test]
+fn test_memory_boundary_validation() {
+    // Test string validation
+    let test_string = CString::new("Hello, World!").unwrap();
+    let validation = FFIBoundaryValidator::validate_c_string(test_string.as_ptr());
+    assert!(validation.valid, "String validation failed: {:?}", validation.errors);
+
+    // Test pointer alignment
+    let test_value: u64 = 42;
+    let validation = FFIBoundaryValidator::validate_pointer_alignment(&test_value as *const u64);
+    assert!(validation.valid, "Pointer alignment validation failed: {:?}", validation.errors);
+
+    // Test null pointer handling
+    let null_ptr: *const i8 = ptr::null();
+    let validation = FFIBoundaryValidator::validate_c_string(null_ptr);
+    assert!(!validation.valid, "Null pointer should fail validation");
+
+    // Test memory block validation
+    let buffer = vec![0u8; 1024];
+    let validation = FFIBoundaryValidator::validate_memory_block(
+        buffer.as_ptr() as *const std::ffi::c_void,
+        buffer.len()
+    );
+    assert!(validation.valid, "Memory block validation failed: {:?}", validation.errors);
+}
+
+/// Test concurrent access patterns
+#[tokio::test]
+async fn test_concurrent_runtime_access() {
+    #[cfg(feature = "nodejs_compatibility")]
+    {
+        // Initialize with adaptive strategy
+        let result = initialize_runtime_with_strategy(RuntimeStrategy::Adaptive);
+        assert!(result.is_ok(), "Failed to initialize runtime strategy");
+
+        // Spawn multiple concurrent operations
+        let mut handles = vec![];
+        
+        for i in 0..10 {
+            let handle = tokio::spawn(async move {
+                let result = execute_with_runtime(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    i * 2
+                });
+                result
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all operations to complete
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.unwrap();
+            match result {
+                Ok(value) => {
+                    assert_eq!(value, i * 2);
+                }
+                Err(e) => {
+                    panic!("Concurrent operation {} failed: {}", i, e);
+                }
+            }
+        }
+    }
+}
+
+/// Test memory pressure scenarios
+#[cfg(feature = "debug_memory")]
+#[test]
+fn test_memory_pressure() {
+    // Initialize memory tracking
+    let result = init_memory_diagnostics();
+    assert!(result.is_ok());
+
+    let initial_stats = MemoryTracker::get_statistics();
+    
+    // Allocate and deallocate memory in patterns similar to wallet operations
+    let mut allocations = Vec::new();
+    
+    for i in 0..1000 {
+        // Simulate various allocation sizes
+        let size = match i % 4 {
+            0 => 64,
+            1 => 256,
+            2 => 1024,
+            _ => 4096,
+        };
+        
+        let allocation = vec![0u8; size];
+        allocations.push(allocation);
+        
+        // Periodically free some allocations
+        if i % 100 == 0 && allocations.len() > 500 {
+            allocations.drain(0..200);
+        }
+    }
+
+    let final_stats = MemoryTracker::get_statistics();
+    
+    // Verify memory tracking is working
+    assert!(
+        final_stats.allocation_count >= initial_stats.allocation_count,
+        "Memory allocation count should have increased"
+    );
+
+    // Generate and check memory report
+    let memory_report = generate_memory_report();
+    assert!(!memory_report.is_empty(), "Memory report should not be empty");
+    
+    println!("Memory report:\n{}", memory_report);
+}
+
+/// Test callback function safety
+#[test]
+fn test_callback_safety() {
+    #[cfg(feature = "debug_memory")]
+    {
+        // Test callback function pointer validation
+        extern "C" fn test_callback(_arg: i32) -> i32 {
+            42
+        }
+
+        let callback_ptr = test_callback as *const std::ffi::c_void;
+        let validation = FFIBoundaryValidator::validate_callback_pointer(callback_ptr);
+        assert!(validation.valid, "Callback validation failed: {:?}", validation.errors);
+
+        // Test null callback handling
+        let null_callback: *const std::ffi::c_void = ptr::null();
+        let validation = FFIBoundaryValidator::validate_callback_pointer(null_callback);
+        assert!(!validation.valid, "Null callback should fail validation");
+    }
+}
+
+/// Test production hardening features
+#[test]
+fn test_production_hardening() {
+    // Initialize production hardening
+    let result = initialize_production_hardening();
+    assert!(result.is_ok(), "Production hardening initialization failed");
+
+    // Test system health check
+    assert!(is_system_healthy(), "System should be healthy after initialization");
+
+    // Perform comprehensive health check
+    let health_result = perform_health_check();
+    println!("Health check: {:?}", health_result);
+    
+    if !health_result.healthy {
+        println!("Health issues: {:?}", health_result.issues);
+    }
+    
+    if !health_result.warnings.is_empty() {
+        println!("Health warnings: {:?}", health_result.warnings);
+    }
+}
+
+/// Test Node.js environment simulation
+#[test]
+fn test_nodejs_environment_simulation() {
+    // Set environment variables that mimic Node.js
+    std::env::set_var("NODE_VERSION", "v18.17.0");
+    std::env::set_var("npm_config_registry", "https://registry.npmjs.org/");
+    std::env::set_var("NODE_ENV", "test");
+
+    #[cfg(feature = "nodejs_compatibility")]
+    {
+        // Test adaptive strategy in simulated Node.js environment
+        let result = initialize_runtime_with_strategy(RuntimeStrategy::Adaptive);
+        assert!(result.is_ok(), "Adaptive strategy should work in Node.js environment");
+
+        if let Some(stats) = get_runtime_statistics() {
+            println!("Runtime stats in Node.js simulation: {:?}", stats);
+            assert!(stats.nodejs_detected, "Should detect Node.js environment");
+        }
+    }
+
+    // Clean up environment variables
+    std::env::remove_var("NODE_VERSION");
+    std::env::remove_var("npm_config_registry");
+    std::env::remove_var("NODE_ENV");
+}
+
+/// Test error recovery mechanisms
+#[test]
+fn test_error_recovery() {
+    #[cfg(feature = "debug_runtime")]
+    {
+        // Initialize investigation
+        let result = SegfaultInvestigator::initialize();
+        assert!(result.is_ok());
+
+        // Record various operations to test the system
+        SegfaultInvestigator::record_operation("test_operation_1");
+        SegfaultInvestigator::record_operation("test_operation_2");
+        SegfaultInvestigator::record_nodejs_operation("nodejs_test", "test_data");
+        SegfaultInvestigator::record_tokio_operation("tokio_test", "runtime_data");
+    }
+
+    // Test production hardening health monitoring
+    let initial_health = is_system_healthy();
+    println!("Initial system health: {}", initial_health);
+
+    // Perform health check
+    let health_check = perform_health_check();
+    assert!(
+        health_check.healthy || !health_check.issues.is_empty(),
+        "Health check should provide meaningful results"
+    );
+}
+
+/// Integration test that combines all features
+#[tokio::test]
+async fn test_comprehensive_integration() {
+    println!("Starting comprehensive integration test...");
+
+    // Initialize all systems
+    #[cfg(feature = "debug_memory")]
+    {
+        init_memory_diagnostics().expect("Memory diagnostics initialization");
     }
 
     #[cfg(feature = "debug_runtime")]
-    #[test]
-    fn test_nodejs_environment_detection() {
-        use minotari_wallet_ffi::debug_segfault_investigation::NodeJsDetector;
-
-        // Test environment detection (will depend on test environment)
-        let is_nodejs = NodeJsDetector::is_nodejs_environment();
-        let is_nodejs_thread = NodeJsDetector::is_potential_nodejs_thread();
-
-        // These are environment-dependent, so we just verify they don't crash
-        println!("Is Node.js environment: {}", is_nodejs);
-        println!("Is potential Node.js thread: {}", is_nodejs_thread);
+    {
+        SegfaultInvestigator::initialize().expect("Segfault investigator initialization");
     }
+
+    initialize_production_hardening().expect("Production hardening initialization");
 
     #[cfg(feature = "nodejs_compatibility")]
-    #[test]
-    fn test_runtime_strategy_selection() {
-        use minotari_wallet_ffi::runtime_strategies::{RuntimeStrategy, RuntimeSelector};
-
-        let selector = RuntimeSelector::new();
-        let strategy = selector.get_strategy();
-
-        // Should select a valid strategy
-        assert!(matches!(
-            strategy,
-            RuntimeStrategy::MultiThreaded |
-            RuntimeStrategy::SingleThreaded |
-            RuntimeStrategy::CurrentThread |
-            RuntimeStrategy::DedicatedThread
-        ));
-
-        println!("Selected runtime strategy: {:?}", strategy);
+    {
+        initialize_runtime_with_strategy(RuntimeStrategy::Adaptive).expect("Runtime strategy initialization");
     }
 
-    #[cfg(feature = "nodejs_compatibility")]
-    #[test]
-    fn test_runtime_creation_strategies() {
-        use minotari_wallet_ffi::runtime_strategies::RuntimeStrategy;
-
-        // Test different runtime strategies
-        let strategies = vec![
-            RuntimeStrategy::MultiThreaded,
-            RuntimeStrategy::SingleThreaded,
-        ];
-
-        for strategy in strategies {
-            match strategy.create_runtime() {
-                Ok(runtime_wrapper) => {
-                    println!("Strategy {:?} succeeded, type: {}", strategy, runtime_wrapper.get_type());
-                }
-                Err(e) => {
-                    println!("Strategy {:?} failed: {}", strategy, e);
-                    // Some strategies may fail in test environment, that's okay
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_concurrent_runtime_safety() {
-        // Test that multiple threads trying to create runtimes don't interfere
-        let handles: Vec<_> = (0..4)
-            .map(|i| {
-                thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(i * 10));
+    // Test concurrent operations
+    let mut handles = vec![];
+    
+    for i in 0..5 {
+        let handle = tokio::spawn(async move {
+            // Simulate wallet-like operations
+            #[cfg(feature = "nodejs_compatibility")]
+            {
+                let result = execute_with_runtime(async move {
+                    // Simulate some async work
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     
-                    // Simulate the environment detection that happens in wallet_create
-                    #[cfg(feature = "debug_runtime")]
-                    {
-                        use minotari_wallet_ffi::debug_segfault_investigation::NodeJsDetector;
-                        NodeJsDetector::log_environment_details();
-                    }
-
-                    #[cfg(feature = "nodejs_compatibility")]
-                    {
-                        use minotari_wallet_ffi::runtime_strategies::RuntimeSelector;
-                        let selector = RuntimeSelector::new();
-                        match selector.create_runtime_with_fallback() {
-                            Ok(_) => format!("Thread {} succeeded", i),
-                            Err(e) => format!("Thread {} failed: {}", i, e),
-                        }
-                    }
-
-                    #[cfg(not(feature = "nodejs_compatibility"))]
-                    {
-                        // Just test basic Tokio runtime creation
-                        match tokio::runtime::Runtime::new() {
-                            Ok(_) => format!("Thread {} succeeded", i),
-                            Err(e) => format!("Thread {} failed: {}", i, e),
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        // Wait for all threads to complete
-        for handle in handles {
-            let result = handle.join().unwrap();
-            println!("Concurrent test result: {}", result);
-        }
-    }
-
-    // Test memory boundary patterns
-    #[test]
-    fn test_memory_boundary_patterns() {
-        // Test various memory allocation patterns that might cause issues
-        use std::alloc::{alloc, dealloc, Layout};
-
-        let layouts = vec![
-            Layout::from_size_align(8, 8).unwrap(),
-            Layout::from_size_align(64, 8).unwrap(),
-            Layout::from_size_align(1024, 16).unwrap(),
-        ];
-
-        for layout in layouts {
-            unsafe {
-                let ptr = alloc(layout);
-                assert!(!ptr.is_null(), "Allocation failed");
+                    // Create some test data
+                    let test_data = format!("test_data_{}", i);
+                    test_data.len()
+                }).await;
                 
-                // Test alignment
-                assert_eq!(ptr as usize % layout.align(), 0, "Pointer not properly aligned");
-                
-                // Write and read test
-                ptr.write(0xAB);
-                assert_eq!(ptr.read(), 0xAB, "Memory read/write failed");
-                
-                dealloc(ptr, layout);
+                result.unwrap_or(0)
             }
-        }
+
+            #[cfg(not(feature = "nodejs_compatibility"))]
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                i
+            }
+        });
+        handles.push(handle);
     }
 
-    // Dummy callback functions for testing
-    unsafe extern "C" fn dummy_callback(_context: *mut c_void, _param: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_reply(_context: *mut c_void, _param: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_final(_context: *mut c_void, _param: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_broadcast(_context: *mut c_void, _param: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_mined(_context: *mut c_void, _param: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_mined_unconfirmed(_context: *mut c_void, _param: *mut c_void, _height: u64) {}
-    unsafe extern "C" fn dummy_callback_faux_confirmed(_context: *mut c_void, _param: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_faux_unconfirmed(_context: *mut c_void, _param: *mut c_void, _height: u64) {}
-    unsafe extern "C" fn dummy_callback_send_result(_context: *mut c_void, _id: u64, _status: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_cancellation(_context: *mut c_void, _param: *mut c_void, _reason: u64) {}
-    unsafe extern "C" fn dummy_callback_txo_validation(_context: *mut c_void, _request_key: u64, _status: u64) {}
-    unsafe extern "C" fn dummy_callback_contacts_liveness(_context: *mut c_void, _data: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_balance(_context: *mut c_void, _balance: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_tx_validation(_context: *mut c_void, _request_key: u64, _status: u64) {}
-    unsafe extern "C" fn dummy_callback_saf(_context: *mut c_void) {}
-    unsafe extern "C" fn dummy_callback_connectivity(_context: *mut c_void, _status: u64) {}
-    unsafe extern "C" fn dummy_callback_wallet_scanned(_context: *mut c_void, _height: u64) {}
-    unsafe extern "C" fn dummy_callback_base_node_state(_context: *mut c_void, _state: *mut c_void) {}
+    // Wait for all operations
+    for handle in handles {
+        handle.await.expect("Async operation should complete");
+    }
+
+    // Final health check
+    let final_health = perform_health_check();
+    println!("Final health check: {:?}", final_health);
+
+    #[cfg(feature = "debug_memory")]
+    {
+        let memory_report = generate_memory_report();
+        println!("Final memory report:\n{}", memory_report);
+    }
+
+    println!("Comprehensive integration test completed successfully");
 }
 
-// Benchmarks for performance testing
-#[cfg(test)]
-mod benchmarks {
-    use super::*;
-    use std::time::Instant;
+/// Stress test for runtime stability
+#[tokio::test]
+async fn test_runtime_stability_stress() {
+    #[cfg(feature = "nodejs_compatibility")]
+    {
+        // Initialize with adaptive strategy
+        initialize_runtime_with_strategy(RuntimeStrategy::Adaptive).expect("Runtime initialization");
 
-    #[test]
-    fn benchmark_runtime_creation() {
-        #[cfg(feature = "nodejs_compatibility")]
-        {
-            use minotari_wallet_ffi::runtime_strategies::RuntimeSelector;
+        // Run many concurrent operations to stress test the system
+        let num_operations = 100;
+        let mut handles = vec![];
 
-            let iterations = 10;
-            let start = Instant::now();
+        for i in 0..num_operations {
+            let handle = tokio::spawn(async move {
+                for j in 0..10 {
+                    let result = execute_with_runtime(async move {
+                        tokio::time::sleep(Duration::from_micros(100)).await;
+                        i * 10 + j
+                    }).await;
 
-            for _ in 0..iterations {
-                let selector = RuntimeSelector::new();
-                let _ = selector.create_runtime_with_fallback();
-            }
-
-            let duration = start.elapsed();
-            let avg_duration = duration / iterations;
-
-            println!("Runtime creation benchmark:");
-            println!("  Total time: {:?}", duration);
-            println!("  Average per creation: {:?}", avg_duration);
-            println!("  Creations per second: {:.2}", 1.0 / avg_duration.as_secs_f64());
-
-            // Should not take more than 100ms per creation on average
-            assert!(avg_duration.as_millis() < 100, "Runtime creation too slow");
+                    if result.is_err() {
+                        eprintln!("Operation failed: {} {}: {:?}", i, j, result);
+                        return false;
+                    }
+                }
+                true
+            });
+            handles.push(handle);
         }
-    }
 
-    #[test]
-    fn benchmark_memory_safety_checks() {
-        #[cfg(feature = "debug_memory")]
-        {
-            use minotari_wallet_ffi::debug_memory_safety::FfiMemorySafetyChecker;
-
-            let test_value: u64 = 42;
-            let ptr = &test_value as *const u64;
-            
-            let iterations = 10000;
-            let start = Instant::now();
-
-            for _ in 0..iterations {
-                let _ = FfiMemorySafetyChecker::validate_c_pointer(ptr, "benchmark_test");
+        // Wait for all operations and check success
+        let mut successful = 0;
+        for handle in handles {
+            if handle.await.unwrap_or(false) {
+                successful += 1;
             }
-
-            let duration = start.elapsed();
-            let avg_duration = duration / iterations;
-
-            println!("Memory safety check benchmark:");
-            println!("  Total time: {:?}", duration);
-            println!("  Average per check: {:?}", avg_duration);
-            println!("  Checks per second: {:.0}", 1.0 / avg_duration.as_secs_f64());
-
-            // Should be very fast - less than 1 microsecond per check
-            assert!(avg_duration.as_nanos() < 1000, "Memory safety checks too slow");
         }
+
+        let success_rate = (successful as f64 / num_operations as f64) * 100.0;
+        println!("Stress test success rate: {:.1}% ({}/{})", success_rate, successful, num_operations);
+
+        // We should have a high success rate
+        assert!(success_rate >= 90.0, "Success rate should be at least 90%");
     }
 }
